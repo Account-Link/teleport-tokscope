@@ -1,0 +1,47 @@
+{
+  "name": "teleport-tokscope",
+  "version": "1.0.0",
+  "description": "TikTok data collection with TEE support",
+  "main": "tokscope.js",
+  "bin": {
+    "tokscope": "./tokscope.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev:modules": "node scripts/module-server.js",
+    "dev:enclave": "npm run build && cd tokscope-enclave && npm run dev",
+    "dev": "npm run dev:modules & npm run dev:enclave",
+    "test:enclave": "npm run build && node tests/enclave/test-enclave-modules.js",
+    "start:audit": "docker compose -f docker-compose-audit.yml up -d",
+    "enclave": "docker compose -f docker-compose-audit.yml up -d",
+    "down": "docker compose down",
+    "clean": "docker compose down && rm -rf output/*.json output/*.txt",
+    "check": "npm run build && node -c workbench.js && node -c lib/mobile-api-client.js && node -c lib/browser-automation-client.js && node -c lib/web-api-client.js && node -c tests/test-direct-api.js && node -c tests/test-watch-history.js && node -c tests/watch-history.test.js",
+    "test-dev": "npm run build && node tests/test-dev-core.js",
+    "demo": "npm run build && node test/test-simple-demo.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.2",
+    "axios": "^1.10.0",
+    "dockerode": "^4.0.2",
+    "express": "^4.18.2",
+    "jimp": "^1.6.0",
+    "jsqr": "^1.4.0",
+    "playwright": "^1.41.0",
+    "qrcode": "^1.5.3",
+    "socks-proxy-agent": "^8.0.5",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.17",
+    "@types/node": "^20.16.5",
+    "@typescript-eslint/parser": "^8.44.0",
+    "nodemon": "^3.1.10",
+    "typescript": "^5.6.2"
+  },
+  "author": "Teleport",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

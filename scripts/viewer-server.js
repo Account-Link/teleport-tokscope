@@ -1,0 +1,300 @@
+#!/usr/bin/env node
+/**
+ * Simple standalone neko viewer server
+ * Just serves the WebRTC viewer, nothing else
+ */
+
+const express = require('express');
+const app = express();
+
+const NEKO_URL = process.env.NEKO_URL || 'http://localhost:8080';
+const PORT = process.env.PORT || 4001;
+
+app.get('/', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Neko Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    #video { width: 100vw; height: 100vh; object-fit: contain; }
+    #status { position: absolute; top: 10px; left: 10px; color: white; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 4px; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+  <video id="video" autoplay playsinline muted></video>
+  <script>
+    const NEKO_URL = '${NEKO_URL}';
+    const status = document.getElementById('status');
+    const video = document.getElementById('video');
+    let ws, pc;
+    let pendingIceCandidates = [];
+
+    async function login() {
+      const response = await fetch(NEKO_URL + '/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'neko', password: 'neko' })
+      });
+      const data = await response.json();
+      return data.token;
+    }
+
+    async function connect(retryCount = 0) {
+      try {
+        status.textContent = retryCount > 0 ? \`Retrying (\${retryCount})...\` : 'Logging in...';
+        const token = await login();
+
+        status.textContent = 'Connecting WebSocket...';
+        const wsUrl = NEKO_URL.replace('http://', 'ws://').replace('https://', 'wss://') + '/api/ws?token=' + token;
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          status.textContent = 'Connected, requesting stream...';
+          ws.send(JSON.stringify({ event: 'screen/set', payload: { width: 1280, height: 720 } }));
+          ws.send(JSON.stringify({ event: 'control/request' }));
+          ws.send(JSON.stringify({ event: 'signal/request', payload: { video: {}, audio: {} } }));
+        };
+
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+          console.log('Received:', msg.event, msg.payload ? '(has payload)' : '');
+
+          if (msg.event === 'signal/provide' || msg.event === 'signal/offer') {
+            status.textContent = 'Setting up WebRTC...';
+            console.log('SDP offer received, type:', msg.payload.type);
+            await handleOffer(msg.payload);
+          } else if (msg.event === 'signal/candidate') {
+            if (msg.payload) {
+              if (pc && pc.remoteDescription) {
+                console.log('Adding remote ICE candidate:', msg.payload.candidate.substring(0, 50) + '...');
+                await pc.addIceCandidate(new RTCIceCandidate({
+                  candidate: msg.payload.candidate,
+                  sdpMLineIndex: msg.payload.sdpMLineIndex,
+                  sdpMid: msg.payload.sdpMid
+                }));
+              } else {
+                console.log('Buffering ICE candidate (pc not ready yet)');
+                pendingIceCandidates.push(msg.payload);
+              }
+            }
+          }
+        };
+
+        ws.onerror = (err) => {
+          status.textContent = 'WebSocket error: ' + err;
+        };
+
+        ws.onclose = () => {
+          status.textContent = 'Disconnected';
+        };
+
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+      }
+    }
+
+    async function handleOffer(offer) {
+      const config = {
+        iceServers: offer.iceServers || offer.ice || [],
+        iceTransportPolicy: 'all'
+      };
+
+      pc = new RTCPeerConnection(config);
+
+      video.onloadstart = () => console.log('Video: loadstart');
+      video.onloadeddata = () => console.log('Video: loadeddata');
+      video.oncanplay = () => console.log('Video: canplay');
+      video.oncanplaythrough = () => console.log('Video: canplaythrough');
+      video.onplaying = () => console.log('Video: playing');
+      video.onerror = (e) => console.error('Video error:', e);
+      video.onstalled = () => console.warn('Video: stalled');
+      video.onwaiting = () => console.warn('Video: waiting');
+
+      video.onloadedmetadata = () => {
+        console.log('Video metadata loaded:', {
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight,
+          duration: video.duration,
+          readyState: video.readyState
+        });
+        video.play().then(() => {
+          console.log('Video playing successfully:', video.videoWidth + 'x' + video.videoHeight);
+          status.style.display = 'none';
+        }).catch(e => {
+          console.error('Play failed (need interaction):', e.name, e.message);
+          status.textContent = 'Click to play';
+          status.style.cursor = 'pointer';
+          const tryPlay = () => {
+            video.play().then(() => {
+              status.style.display = 'none';
+              document.removeEventListener('click', tryPlay);
+            }).catch(console.error);
+          };
+          document.addEventListener('click', tryPlay);
+        });
+      };
+
+      pc.ontrack = (event) => {
+        console.log('Track received:', {
+          kind: event.track.kind,
+          id: event.track.id,
+          enabled: event.track.enabled,
+          muted: event.track.muted,
+          readyState: event.track.readyState,
+          streams: event.streams?.length
+        });
+
+        if (event.track.kind === 'video') {
+          status.textContent = 'Video track received, loading...';
+
+          event.track.onended = () => console.log('Video track ended');
+          event.track.onmute = () => console.log('Video track muted');
+          event.track.onunmute = () => console.log('Video track unmuted');
+        }
+
+        if (event.streams && event.streams[0]) {
+          console.log('Setting srcObject, stream:', {
+            id: event.streams[0].id,
+            active: event.streams[0].active,
+            tracks: event.streams[0].getTracks().length
+          });
+          video.srcObject = event.streams[0];
+
+          setTimeout(() => {
+            console.log('Video state after 1s:', {
+              srcObject: !!video.srcObject,
+              readyState: video.readyState,
+              networkState: video.networkState,
+              videoWidth: video.videoWidth,
+              videoHeight: video.videoHeight,
+              paused: video.paused,
+              currentTime: video.currentTime
+            });
+          }, 1000);
+        }
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('ICE candidate:', {
+            type: event.candidate.type,
+            protocol: event.candidate.protocol,
+            address: event.candidate.address,
+            port: event.candidate.port,
+            candidate: event.candidate.candidate.substring(0, 50) + '...'
+          });
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              event: 'signal/candidate',
+              payload: {
+                candidate: event.candidate.candidate,
+                sdpMLineIndex: event.candidate.sdpMLineIndex,
+                sdpMid: event.candidate.sdpMid
+              }
+            }));
+          } else {
+            console.warn('Cannot send ICE candidate, WebSocket state:', ws.readyState);
+          }
+        } else {
+          console.log('ICE gathering complete');
+        }
+      };
+
+      pc.oniceconnectionstatechange = async () => {
+        console.log('ICE connection state:', pc.iceConnectionState);
+        status.textContent = 'ICE: ' + pc.iceConnectionState;
+
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          const stats = await pc.getStats();
+          stats.forEach(stat => {
+            if (stat.type === 'candidate-pair' && stat.state === 'succeeded') {
+              console.log('Active candidate pair:', stat);
+            }
+          });
+          setTimeout(() => { if (video.videoWidth) status.style.display = 'none'; }, 500);
+        } else if (pc.iceConnectionState === 'failed') {
+          console.error('ICE failed, will retry in 1s');
+          status.textContent = 'Connection failed, retrying...';
+          if (pc) pc.close();
+          if (ws) ws.close();
+          setTimeout(() => connect(retryCount + 1), 1000);
+        } else if (pc.iceConnectionState === 'disconnected') {
+          console.warn('ICE disconnected');
+          status.textContent = 'Disconnected';
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log('Peer connection state:', pc.connectionState);
+      };
+
+      pc.onicegatheringstatechange = () => {
+        console.log('ICE gathering state:', pc.iceGatheringState);
+      };
+
+      pc.onsignalingstatechange = () => {
+        console.log('Signaling state:', pc.signalingState);
+      };
+
+      await pc.setRemoteDescription(new RTCSessionDescription({
+        type: offer.type || 'offer',
+        sdp: offer.sdp
+      }));
+
+      // Add any buffered ICE candidates
+      if (pendingIceCandidates.length > 0) {
+        console.log('Adding', pendingIceCandidates.length, 'buffered ICE candidates');
+        for (const candidate of pendingIceCandidates) {
+          await pc.addIceCandidate(new RTCIceCandidate({
+            candidate: candidate.candidate,
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            sdpMid: candidate.sdpMid
+          }));
+        }
+        pendingIceCandidates = [];
+      }
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      ws.send(JSON.stringify({
+        event: 'signal/answer',
+        payload: {
+          type: pc.localDescription.type,
+          sdp: pc.localDescription.sdp
+        }
+      }));
+    }
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      console.log('Page unloading, cleaning up...');
+      if (pc) {
+        console.log('Closing peer connection, state:', pc.connectionState);
+        pc.close();
+      }
+      if (ws) {
+        console.log('Closing WebSocket, state:', ws.readyState);
+        ws.close();
+      }
+    });
+
+    // Page visibility debugging
+    document.addEventListener('visibilitychange', () => {
+      console.log('Page visibility changed:', document.visibilityState);
+    });
+
+    console.log('Starting connection...');
+    connect();
+  </script>
+</body>
+</html>`);
+});
+
+app.listen(PORT, () => {
+  console.log(`🎥 Neko viewer running on http://localhost:${PORT}`);
+  console.log(`📡 Neko URL: ${NEKO_URL}`);
+});

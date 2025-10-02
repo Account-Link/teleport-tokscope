@@ -1,0 +1,80 @@
+services:
+  tokscope-enclave:
+    build:
+      context: .
+      dockerfile: tokscope-enclave/Dockerfile.api
+    container_name: tokscope-enclave
+    hostname: tokscope-enclave
+    ports:
+      - "3000:3000"  # Enclave API endpoint
+    restart: "no"
+    environment:
+      - WEB_AUTH_MODULE_URL=${WEB_AUTH_MODULE_URL}
+      - MOBILE_AUTH_MODULE_URL=${MOBILE_AUTH_MODULE_URL}
+      - WATCH_HISTORY_MODULE_URL=${WATCH_HISTORY_MODULE_URL}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,noexec,nosuid,nodev
+      - /var/tmp:size=100M,noexec,nosuid,nodev
+      - /app/node_modules/.cache:size=50M,noexec,nosuid,nodev
+    networks:
+      enclave-api-network:
+        ipv4_address: 172.22.0.2
+    depends_on:
+      - browser-manager
+
+  browser-manager:
+    build:
+      context: .
+      dockerfile: tokscope-enclave/Dockerfile.browser-manager
+    container_name: browser-manager
+    hostname: browser-manager
+    # No external ports - only accessible from API server
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DOCKER_NETWORK=xordi-automation-devenv_enclave-api-network
+      - TCB_BROWSER_IMAGE=xordi-automation-devenv-tcb-browser:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket access
+    cap_add:
+      - SYS_ADMIN  # Required for container management
+    # Security hardening (limited due to Docker socket requirement)
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=100M,noexec,nosuid,nodev
+      - /var/tmp:size=100M,noexec,nosuid,nodev
+    restart: "no"
+    networks:
+      enclave-api-network:
+        ipv4_address: 172.22.0.3
+      browser-network:
+        ipv4_address: 172.23.0.2
+
+  # Pre-build browser image for dynamic container creation
+  tcb-browser:
+    build:
+      context: .
+      dockerfile: tokscope-enclave/Dockerfile.browser
+    image: xordi-automation-devenv-tcb-browser:latest
+    # This service won't run, it just builds the image
+    profiles:
+      - build-only
+
+networks:
+  enclave-api-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24
+
+  browser-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24

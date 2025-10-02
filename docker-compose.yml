@@ -1,0 +1,39 @@
+services:
+  dev-browser:
+    build:
+      context: .
+      dockerfile: tokscope-enclave/Dockerfile.browser
+      args:
+        - CHROMIUM_CONF_SOURCE=tokscope-dev
+    container_name: ${XORDI_AGENT_ID:-simple}-dev-browser
+    hostname: ${XORDI_AGENT_ID:-simple}-dev-browser
+    environment:
+      - CONTAINER_NAME=dev-browser
+      - NEKO_NAT1TO1=127.0.0.1
+      - SOCKS5_PROXY=${SOCKS5_PROXY:-}
+      - CHROMIUM_PROXY_ARG=${SOCKS5_PROXY:+--proxy-server=socks5://127.0.0.1:1080}
+      # WebRTC configuration - TCP only
+      - NEKO_WEBRTC_ICELITE=true
+      - NEKO_WEBRTC_TCPMUX=56000
+      - NEKO_WEBRTC_ICESERVERS_FRONTEND=
+      - NEKO_WEBRTC_ICESERVERS_BACKEND=
+      # Auth configuration
+      - NEKO_MEMBER_PROVIDER=multiuser
+      - NEKO_MEMBER_MULTIUSER_USER_PASSWORD=neko
+      - NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=admin
+    ports:
+      - "8080:8080"
+      - "9223:9223"
+      - "56000:56000/tcp"
+    restart: "no"  # Don't auto-restart, one-time use
+    networks:
+      auth-network:
+        ipv4_address: 17.${XORDI_SUBNET_THIRD_OCTET:-100}.0.3
+
+
+networks:
+  auth-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 17.${XORDI_SUBNET_THIRD_OCTET:-100}.0.0/24

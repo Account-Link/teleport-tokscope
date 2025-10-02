@@ -1,0 +1,28 @@
+{
+  "default_count": 3,
+  "rate_limit_ms": 2000,
+  "max_session_age_hours": 48,
+  "output_format": "txt",
+  "container": {
+    "name": "simple-dev-browser",
+    "cdp_port": 9223,
+    "web_port": 8080,
+    "qr_server_port": 3334
+  },
+  "sampling": {
+    "max_retries": 3,
+    "timeout_seconds": 30,
+    "batch_size": 8
+  },
+  "output": {
+    "include_metadata": true,
+    "include_stats": true,
+    "timestamp_format": "iso"
+  },
+  "tcb": {
+    "max_concurrent_sessions": 50,
+    "session_timeout_ms": 3600000,
+    "max_browser_containers": 5,
+    "container_idle_timeout_ms": 600000
+  }
+}

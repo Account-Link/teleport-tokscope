@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1.7
+# Multi-stage Dockerfile.browser-manager with deterministic TypeScript build
+ARG SOURCE_DATE_EPOCH
+ARG DEBIAN_SNAPSHOT
+
+# Build stage
+FROM node:18-slim@sha256:f9ab18e354e6855ae56ef2b290dd225c1e51a564f87584b9bd21dd651838830e AS builder
+
+# Import ARG into this stage
+ARG SOURCE_DATE_EPOCH
+ARG DEBIAN_SNAPSHOT
+
+# Set environment for reproducible builds
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_PROGRESS=false \
+    NPM_CONFIG_LOGLEVEL=error \
+    NPM_CONFIG_USERCONFIG=/dev/null \
+    NPM_CONFIG_UNSAFE_PERM=true \
+    npm_config_cache=/npm-cache
+
+WORKDIR /app
+
+# Copy package files and install ALL dependencies (including dev deps for TypeScript)
+COPY xordi-enclave/package.json ./package.json
+COPY xordi-enclave/package-lock.json ./package-lock.json
+RUN mkdir -p /npm-cache && \
+    npm ci --ignore-scripts --prefer-offline --no-audit --fund=false && \
+    # Reproducibility: touch disabled find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} + &&find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} + && \
+    rm -rf /npm-cache
+
+# Copy TypeScript source files
+COPY xordi-enclave/*.ts ./
+COPY lib/ ./lib/
+COPY xordi-enclave/tsconfig.json ./tsconfig.json
+
+# Build TypeScript to JavaScript
+RUN npm run build
+
+# Runtime stage - EXPLICIT DEPENDENCY ON BUILDER
+FROM node:18-slim@sha256:f9ab18e354e6855ae56ef2b290dd225c1e51a564f87584b9bd21dd651838830e AS runtime
+
+# Import ARG into this stage
+ARG SOURCE_DATE_EPOCH
+ARG DEBIAN_SNAPSHOT
+
+# Set environment for reproducible builds
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_PROGRESS=false \
+    NPM_CONFIG_LOGLEVEL=error \
+    NPM_CONFIG_USERCONFIG=/dev/null \
+    NPM_CONFIG_UNSAFE_PERM=true \
+    npm_config_cache=/npm-cache
+
+# FORCE ORDERING: Install system packages FIRST, then copy built code, then npm install
+# Step 1: System packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    docker.io=20.10.24+dfsg1-1+deb12u1+b2 \
+    curl=7.88.1-10+deb12u14 \
+    ca-certificates=20230311+deb12u1 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /var/log/apt/* && \
+    rm -rf /var/log/dpkg.log && \
+    rm -rf /var/log/alternatives.log && \
+    rm -rf /var/cache/ldconfig/aux-cache
+
+WORKDIR /app
+
+# Step 2: Copy built JavaScript BEFORE npm install to force dependency
+COPY --from=builder /app/dist/ ./
+
+# Step 3: Package files and npm install AFTER copying built code
+COPY xordi-enclave/package.json ./package.json
+COPY xordi-enclave/package-lock.json ./package-lock.json
+RUN mkdir -p /npm-cache && \
+    npm ci --omit=dev --ignore-scripts --prefer-offline --no-audit --fund=false && \
+    # Reproducibility: touch disabled find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} + &&find /app -exec touch -d "@${SOURCE_DATE_EPOCH}" {} + && \
+    rm -rf /npm-cache
+
+# Set environment
+ENV NODE_ENV=production
+ENV DOCKER_HOST=unix:///var/run/docker.sock
+
+# Start browser manager
+CMD ["node", "browser-manager.js"]

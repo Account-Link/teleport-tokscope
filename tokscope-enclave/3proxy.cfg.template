@@ -1,0 +1,13 @@
+daemon
+log /dev/stdout
+logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+
+# Listen on all interfaces port 1080 for unauthenticated SOCKS5
+socks -p1080
+
+# Forward to upstream authenticated SOCKS5 proxy
+# Environment variables: UPSTREAM_PROXY_HOST, UPSTREAM_PROXY_PORT, UPSTREAM_PROXY_USER, UPSTREAM_PROXY_PASS
+parent 1000 socks5 %(UPSTREAM_PROXY_HOST)s:%(UPSTREAM_PROXY_PORT)s %(UPSTREAM_PROXY_USER)s %(UPSTREAM_PROXY_PASS)s
+
+# Allow all users
+users *

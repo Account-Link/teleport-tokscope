@@ -1,0 +1,21 @@
+# Build artifacts and debug directories
+tagged/
+debug-comparison/
+verification-debug/
+builkitinvestigate/
+fixed-extract/
+
+# Documentation and notes
+docs/
+notes/
+
+# Output and cache directories
+output/
+output.bak/
+audit-tools/__pycache__/
+
+# Git refs
+refs/
+
+# Verification files
+verify-*.tar
