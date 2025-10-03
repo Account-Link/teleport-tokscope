@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The dashboard is a **standalone external service** that demonstrates how an untrusted host can interact with the xordi enclave. It's explicitly outside the trusted compute base and serves as both:
+The dashboard is a **standalone external service** that demonstrates how an untrusted host can interact with the tokscope enclave. It's explicitly outside the trusted compute base and serves as both:
 1. A practical management interface for enclave instances
 2. A reference implementation for external API consumers
 
@@ -22,7 +22,7 @@ The dashboard is a **standalone external service** that demonstrates how an untr
            │ HTTP API
            ▼
 ┌─────────────────────┐
-│  Xordi Enclave API  │ ← xordi-enclave-api (port 3000)
+│  TokScope Enclave API  │ ← tokscope-enclave-api (port 3000)
 │  (Trusted)          │
 └─────────────────────┘
 ```
@@ -82,7 +82,7 @@ The dashboard is a **standalone external service** that demonstrates how an untr
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ Xordi Enclave Dashboard                                    │
+│ TokScope Enclave Dashboard                                    │
 │ ● Connected | Health: Healthy | Sessions: 2/10             │
 │ Containers: 5 available | Uptime: 2h 15m                   │
 ├────────────────────────────────────────────────────────────┤
@@ -129,7 +129,7 @@ The dashboard is a **standalone external service** that demonstrates how an untr
 - `GET /dashboard/health` - Get enclave health
 
 ### Internal (to enclave)
-All proxied through to `http://xordi-enclave-api:3000`
+All proxied through to `http://tokscope-enclave-api:3000`
 
 ## Data Storage
 

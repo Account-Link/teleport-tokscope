@@ -12,6 +12,6 @@
     "moduleResolution": "node",
     "allowSyntheticDefaultImports": true
   },
-  "include": ["lib/**/*.ts", "test/**/*.ts", "xordi-enclave/*.ts"],
+  "include": ["lib/**/*.ts", "test/**/*.ts", "tokscope-enclave/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

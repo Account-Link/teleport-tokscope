@@ -139,7 +139,7 @@ export class EnclaveModuleLoader {
   }
 }
 
-// Example usage for xordi-enclave integration:
+// Example usage for tokscope-enclave integration:
 export function loadTikTokAuthModule(modulePath: string) {
   const loader = new EnclaveModuleLoader({
     maxRequiredModules: ['crypto'],

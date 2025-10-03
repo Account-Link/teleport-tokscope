@@ -1,8 +1,8 @@
 services:
-  xordi-enclave:
-    image: socrates1024/xordi-enclave-api:d56f506
-    container_name: xordi-enclave
-    hostname: xordi-enclave
+  tokscope-enclave:
+    image: socrates1024/tokscope-enclave-api:d56f506
+    container_name: tokscope-enclave
+    hostname: tokscope-enclave
     ports:
       - "3000:3000"  # Enclave API endpoint
     restart: "no"
@@ -21,7 +21,7 @@ services:
       - browser-manager
 
   browser-manager:
-    image: socrates1024/xordi-browser-manager:d56f506-server
+    image: socrates1024/tokscope-browser-manager:d56f506-server
     container_name: browser-manager
     hostname: browser-manager
     # No external ports - only accessible from API server

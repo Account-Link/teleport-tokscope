@@ -23,16 +23,16 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
 WORKDIR /app
 
 # Copy package files and install ALL dependencies (including dev deps for TypeScript)
-COPY xordi-enclave/package.json ./package.json
-COPY xordi-enclave/package-lock.json ./package-lock.json
+COPY tokscope-enclave/package.json ./package.json
+COPY tokscope-enclave/package-lock.json ./package-lock.json
 RUN mkdir -p /npm-cache && \
     npm ci --ignore-scripts --prefer-offline --no-audit --fund=false && \
     rm -rf /npm-cache
 
 # Copy TypeScript source files
-COPY xordi-enclave/*.ts ./
+COPY tokscope-enclave/*.ts ./
 COPY lib/ ./lib/
-COPY xordi-enclave/tsconfig.json ./tsconfig.json
+COPY tokscope-enclave/tsconfig.json ./tsconfig.json
 
 # Build TypeScript to JavaScript
 RUN npm run build
@@ -72,8 +72,8 @@ COPY --from=builder /app/dist/ ./
 COPY --from=builder /app/lib/ ./lib/
 
 # Step 3: Package files and npm install AFTER copying built code
-COPY xordi-enclave/package.json ./package.json
-COPY xordi-enclave/package-lock.json ./package-lock.json
+COPY tokscope-enclave/package.json ./package.json
+COPY tokscope-enclave/package-lock.json ./package-lock.json
 RUN mkdir -p /npm-cache && \
     npm ci --omit=dev --ignore-scripts --prefer-offline --no-audit --fund=false && \
     rm -rf /npm-cache

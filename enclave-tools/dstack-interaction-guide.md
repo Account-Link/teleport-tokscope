@@ -59,14 +59,14 @@ https://{app-id}-8090.{gateway-domain}/logs/{service-name}?{parameters}
 
 ### Examples:
 ```bash
-# Get xordi-enclave service logs (last 20 lines with timestamps)
-curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/xordi-enclave?text&bare&timestamps&tail=20"
+# Get tokscope-enclave service logs (last 20 lines with timestamps)
+curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/tokscope-enclave?text&bare&timestamps&tail=20"
 
 # Get browser-manager service logs
 curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/browser-manager?text&bare&timestamps&tail=20"
 
 # Follow live logs
-curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/xordi-enclave?text&bare&timestamps&follow"
+curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/tokscope-enclave?text&bare&timestamps&follow"
 ```
 
 ## Finding Service Names
@@ -124,6 +124,6 @@ curl -k https://...  # Skip SSL verification
 
 - **App ID**: `c651380e78f32f161efcaaaba74f0dca208a980c`
 - **Gateway**: `dstack-base-prod7.phala.network`
-- **Services**: `xordi-enclave`, `browser-manager`
+- **Services**: `tokscope-enclave`, `browser-manager`
 - **Main App**: Port 3000
 - **Node Info**: Port 8090

@@ -1,7 +1,7 @@
 /**
- * Xordi Enclave Dashboard
+ * TokScope Enclave Dashboard
  *
- * This example dashboard facilitates using the xordi-enclave interface by providing:
+ * This example dashboard facilitates using the tokscope-enclave interface by providing:
  * - Web UI for managing TikTok authentication sessions (via QR code)
  * - Session persistence across restarts
  * - Visual controls for sampling For You page and Watch History
@@ -269,7 +269,7 @@ app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
 <head>
-  <title>Xordi Enclave Dashboard</title>
+  <title>TokScope Enclave Dashboard</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, sans-serif; background: #f5f5f5; }
@@ -316,7 +316,7 @@ app.get('/', (req, res) => {
 </head>
 <body>
   <div class="header">
-    <h1>Xordi Enclave Dashboard</h1>
+    <h1>TokScope Enclave Dashboard</h1>
     <div class="status">
       <span><div class="indicator" id="statusIndicator"></div><span id="statusText">Connecting...</span></span>
       <span id="sessionCount">Sessions: -/-</span>

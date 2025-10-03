@@ -22,8 +22,8 @@ SNAPSHOT_DATE="20240915T000000Z" ./enclave-tools/prepare-deterministic-build.sh
 ```
 
 **Output artifacts:**
-- `xordi-enclave-api.tar` - API server image
-- `xordi-enclave-manager.tar` - Browser orchestrator image
+- `tokscope-enclave-api.tar` - API server image
+- `tokscope-enclave-manager.tar` - Browser orchestrator image
 - `xordi-browser.tar` - Chromium browser image
 - `build-manifest.json` - SHA256 hashes for verification
 
@@ -56,7 +56,7 @@ mv build-manifest.json build-manifest-2.json
 Deep comparison of Docker image layers to diagnose non-determinism.
 
 ```bash
-./enclave-tools/compare-layer-contents.sh xordi-enclave-api:build1 xordi-enclave-api:build2
+./enclave-tools/compare-layer-contents.sh tokscope-enclave-api:build1 tokscope-enclave-api:build2
 ```
 
 **What it compares:**
@@ -70,7 +70,7 @@ Deep comparison of Docker image layers to diagnose non-determinism.
 Extracts and compares two image tarballs.
 
 ```bash
-./enclave-tools/extract-and-compare.sh xordi-enclave-api-1.tar xordi-enclave-api-2.tar
+./enclave-tools/extract-and-compare.sh tokscope-enclave-api-1.tar tokscope-enclave-api-2.tar
 ```
 
 ### probe-snapshot.sh
@@ -106,17 +106,17 @@ npm run build
 ### 3. Compare with published images
 ```bash
 # Pull published images
-docker pull registry.example.com/xordi-enclave-api:v1.0.0
-docker save registry.example.com/xordi-enclave-api:v1.0.0 -o published-api.tar
+docker pull registry.example.com/tokscope-enclave-api:v1.0.0
+docker save registry.example.com/tokscope-enclave-api:v1.0.0 -o published-api.tar
 
 # Compare hashes
 sha256sum published-api.tar
-sha256sum xordi-enclave-api.tar
+sha256sum tokscope-enclave-api.tar
 
 # Deep comparison if needed
 ./enclave-tools/compare-layer-contents.sh \
-  registry.example.com/xordi-enclave-api:v1.0.0 \
-  xordi-enclave-api:latest
+  registry.example.com/tokscope-enclave-api:v1.0.0 \
+  tokscope-enclave-api:latest
 ```
 
 ### 4. Verify attestation claims
@@ -164,10 +164,10 @@ The enclave is designed to run in [dstack](https://github.com/Phala-Network/dsta
    ```bash
    # Build and tag
    ./enclave-tools/prepare-deterministic-build.sh
-   docker tag xordi-enclave-api:latest registry.example.com/xordi-enclave-api:v1.0.0
+   docker tag tokscope-enclave-api:latest registry.example.com/tokscope-enclave-api:v1.0.0
 
    # Push to registry
-   docker push registry.example.com/xordi-enclave-api:v1.0.0
+   docker push registry.example.com/tokscope-enclave-api:v1.0.0
    ```
 
 2. **Environment variables** - Create `.env`:
@@ -202,7 +202,7 @@ Monitor and interact with deployed CVMs.
 ./enclave-tools/dstack-monitor.js test <app-id> --gateway dstack-base-prod7.phala.network
 
 # Check logs
-./enclave-tools/dstack-monitor.js logs <app-id> xordi-enclave
+./enclave-tools/dstack-monitor.js logs <app-id> tokscope-enclave
 
 # Get stats
 ./enclave-tools/dstack-monitor.js status <app-id>
@@ -235,8 +235,8 @@ Key differences from local deployment:
 **Example:**
 ```yaml
 services:
-  xordi-enclave-api:
-    image: registry.example.com/xordi-enclave-api:v1.0.0
+  tokscope-enclave-api:
+    image: registry.example.com/tokscope-enclave-api:v1.0.0
     # No build: section - must be pre-built
 ```
 

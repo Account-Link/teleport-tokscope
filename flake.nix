@@ -12,14 +12,14 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # Shared Node.js app build (TypeScript -> JavaScript)
-        xordiEnclave = pkgs.buildNpmPackage {
-          pname = "xordi-enclave";
+        tokscopeEnclave = pkgs.buildNpmPackage {
+          pname = "tokscope-enclave";
           version = "1.0.0";
 
           src = ./.;
 
           # npm dependency hash
-          npmDepsHash = "sha256-T/A0hQHJ5AImTPFmhEUkvZzDYVP0Jg7kLjlUDTCI+iQ=";
+          npmDepsHash = "sha256-oC55ItJDb7SOf+6EVmq4UOGhzAXXyI7NQfMvJO59Tz4=";
 
           # Build TypeScript
           buildPhase = ''
@@ -28,10 +28,10 @@
 
           # Install built JavaScript
           installPhase = ''
-            mkdir -p $out/lib/xordi-enclave
-            cp -r dist/* $out/lib/xordi-enclave/
-            cp -r node_modules $out/lib/xordi-enclave/
-            cp package.json $out/lib/xordi-enclave/
+            mkdir -p $out/lib/tokscope-enclave
+            cp -r dist/* $out/lib/tokscope-enclave/
+            cp -r node_modules $out/lib/tokscope-enclave/
+            cp package.json $out/lib/tokscope-enclave/
           '';
 
           # Reproducible timestamp from git
@@ -40,11 +40,11 @@
 
         # API Docker image
         apiImage = pkgs.dockerTools.buildImage {
-          name = "xordi-enclave-api";
+          name = "tokscope-enclave-api";
           tag = "latest";
 
           contents = with pkgs; [
-            xordiEnclave
+            tokscopeEnclave
             nodejs_18
             socat
             bashInteractive
@@ -52,8 +52,8 @@
           ];
 
           config = {
-            Cmd = [ "${pkgs.nodejs_18}/bin/node" "${xordiEnclave}/lib/xordi-enclave/server.js" ];
-            WorkingDir = "${xordiEnclave}/lib/xordi-enclave";
+            Cmd = [ "${pkgs.nodejs_18}/bin/node" "${tokscopeEnclave}/lib/tokscope-enclave/server.js" ];
+            WorkingDir = "${tokscopeEnclave}/lib/tokscope-enclave";
             ExposedPorts = { "3000/tcp" = {}; };
             Env = [
               "NODE_ENV=production"
@@ -66,11 +66,11 @@
 
         # Manager Docker image
         managerImage = pkgs.dockerTools.buildImage {
-          name = "xordi-enclave-manager";
+          name = "tokscope-enclave-manager";
           tag = "latest";
 
           contents = with pkgs; [
-            xordiEnclave
+            tokscopeEnclave
             nodejs_18
             docker
             curl
@@ -80,8 +80,8 @@
           ];
 
           config = {
-            Cmd = [ "${pkgs.nodejs_18}/bin/node" "${xordiEnclave}/lib/xordi-enclave/browser-manager.js" ];
-            WorkingDir = "${xordiEnclave}/lib/xordi-enclave";
+            Cmd = [ "${pkgs.nodejs_18}/bin/node" "${tokscopeEnclave}/lib/tokscope-enclave/browser-manager.js" ];
+            WorkingDir = "${tokscopeEnclave}/lib/tokscope-enclave";
             Env = [
               "NODE_ENV=production"
               "DOCKER_HOST=unix:///var/run/docker.sock"
@@ -94,8 +94,8 @@
 
       in {
         packages = {
-          default = xordiEnclave;
-          app = xordiEnclave;
+          default = tokscopeEnclave;
+          app = tokscopeEnclave;
           api-image = apiImage;
           manager-image = managerImage;
         };

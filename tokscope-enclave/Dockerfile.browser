@@ -1,7 +1,7 @@
 FROM ghcr.io/m1k1o/neko/chromium:latest
 
 # Build arg to specify config source (defaults to enclave for production)
-ARG CHROMIUM_CONF_SOURCE=xordi-enclave
+ARG CHROMIUM_CONF_SOURCE=tokscope-enclave
 
 # Install dependencies
 RUN apt-get update && \
@@ -11,10 +11,10 @@ RUN apt-get update && \
 
 # Copy configuration files
 COPY ${CHROMIUM_CONF_SOURCE}/chromium.conf /etc/neko/supervisord/chromium.conf
-COPY xordi-enclave/policies.json /etc/chromium/policies/managed/policies.json
-COPY xordi-enclave/openbox.xml /etc/neko/openbox.xml
-COPY xordi-enclave/simple-socks5-relay.js /usr/local/bin/simple-socks5-relay.js
-COPY xordi-enclave/start-3proxy.sh /usr/local/bin/start-3proxy.sh
+COPY tokscope-enclave/policies.json /etc/chromium/policies/managed/policies.json
+COPY tokscope-enclave/openbox.xml /etc/neko/openbox.xml
+COPY tokscope-enclave/simple-socks5-relay.js /usr/local/bin/simple-socks5-relay.js
+COPY tokscope-enclave/start-3proxy.sh /usr/local/bin/start-3proxy.sh
 
 # Make scripts executable
 RUN chmod +x /usr/local/bin/start-3proxy.sh

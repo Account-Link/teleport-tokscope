@@ -1,4 +1,4 @@
-# Xordi Dev Configuration
+# TokScope Dev Configuration
 
 Development-specific configuration for browser containers used by `docker-compose.yml`.
 
@@ -19,10 +19,10 @@ services:
   dev-browser:
     build:
       args:
-        - CHROMIUM_CONF_SOURCE=xordi-dev  # Uses xordi-dev/chromium.conf
+        - CHROMIUM_CONF_SOURCE=tokscope-dev  # Uses tokscope-dev/chromium.conf
 ```
 
-Production mode (docker-compose-audit.yml) defaults to `xordi-enclave/chromium.conf`.
+Production mode (docker-compose-audit.yml) defaults to `tokscope-enclave/chromium.conf`.
 
 ## DevTools Access
 
