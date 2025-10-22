@@ -1,0 +1,25 @@
+Xordi Security Service v2.2.0
+==============================
+
+Forked from:
+- x-gorgon-khronos-argus-ladon-main (GitHub)
+- TikTok-Encryption-research (GitHub)
+
+Fork Date: 2025-08-29
+Purpose: Internal security header generation for Xordi platform
+
+Files sourced from research repositories:
+- XGorgon.py - X-Gorgon header generation
+- XArgus.py - X-Argus header generation  
+- XLadon.py - X-Ladon header generation
+- Simon.py - Simon cipher implementation
+- Sm3.py - SM3 hash implementation
+- TTEncrypt.py - Device registration
+- ByteBuf.py - Binary buffer utilities
+- protobuf.py - Protocol buffer utilities
+
+Customizations:
+- FastAPI wrapper service (main.py)
+- Docker containerization
+- Health check endpoints
+- Error handling and fallbacks

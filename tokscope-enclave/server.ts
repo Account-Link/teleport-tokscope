@@ -4,12 +4,15 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import jsQR from 'jsqr';
 import { Jimp } from 'jimp';
+import axios from 'axios';
 
 const BrowserAutomationClient = require('../dist/lib/browser-automation-client');
 const WebApiClient = require('../dist/lib/web-api-client');
 const { PublicApiClient } = require('../dist/lib/public-api-client');
 const { EnclaveModuleLoader } = require('../dist/lib/enclave-module-loader');
 const QRExtractor = require('../dist/lib/qr-extractor');
+const xordiSecurityModule = require('./xordi-security-module');
+const teeCrypto = require('./tee-crypto');
 
 const BROWSER_MANAGER_URL = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
 
@@ -425,7 +428,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
   }
 });
 
-async function waitForLoginCompletion(authSessionId: string, page: Page): Promise<void> {
+async function waitForLoginCompletion(authSessionId: string, page: Page, preAuthToken?: string): Promise<void> {
   const timeout = 120000; // 2 minutes
   const startTime = Date.now();
 
@@ -440,7 +443,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page): Promis
           (url.includes('tiktok.com') && !url.includes('/login'))) {
         console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}...`);
 
-        // Extract session data
+        // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
 
         authSessionManager!.updateAuthSession(authSessionId, {
@@ -448,10 +451,15 @@ async function waitForLoginCompletion(authSessionId: string, page: Page): Promis
           sessionData
         });
 
-        // Store session
-        if (sessionManager && sessionData) {
-          const newSessionId = sessionManager.storeSession(sessionData);
-          console.log(`💾 Session stored: ${newSessionId.substring(0, 8)}...`);
+        // TEE Integration: Encrypt and store via Xordi
+        if (preAuthToken && sessionData) {
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+        } else {
+          // Legacy flow: Store session locally (fallback)
+          if (sessionManager && sessionData) {
+            const newSessionId = sessionManager.storeSession(sessionData);
+            console.log(`💾 Session stored locally: ${newSessionId.substring(0, 8)}...`);
+          }
         }
 
         // Release browser container
@@ -480,6 +488,89 @@ async function waitForLoginCompletion(authSessionId: string, page: Page): Promis
     await releaseBrowserInstance(authSessionId);
   } catch (releaseError) {
     console.error(`⚠️ Failed to release browser for ${authSessionId}`);
+  }
+}
+
+/**
+ * Store user with TEE-encrypted cookies (Phase 2 + 3 of pre-auth flow)
+ */
+async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken: string, authSessionId: string): Promise<void> {
+  try {
+    const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
+    const xordiApiKey = process.env.XORDI_API_KEY;
+
+    if (!xordiApiKey) {
+      console.error('❌ XORDI_API_KEY not configured - cannot store user with TEE encryption');
+      return;
+    }
+
+    console.log('🔐 Encrypting cookies with TEE key...');
+
+    // Phase 2a: Encrypt cookies IN TEE (plaintext only exists in TEE memory)
+    const teeEncryptedCookies = teeCrypto.encryptCookies(sessionData.cookies);
+
+    console.log(`  Encrypted ${sessionData.cookies?.length || 0} cookies (${teeEncryptedCookies.length} chars)`);
+
+    // Phase 2b: Store user with encrypted cookies in Xordi DB
+    console.log('📤 Storing user with TEE-encrypted cookies in Xordi...');
+
+    const storeResponse = await axios.post(
+      `${xordiApiUrl}/api/enclave/store-user`,
+      {
+        pre_auth_token: preAuthToken,
+        user: sessionData.user,
+        tee_encrypted_cookies: teeEncryptedCookies,
+        device_id: sessionData.tokens?.device_id || sessionData.device_id,
+        install_id: sessionData.tokens?.install_id || sessionData.install_id
+      },
+      {
+        headers: {
+          'X-Api-Key': xordiApiKey,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    if (!storeResponse.data.success) {
+      throw new Error('Xordi rejected user storage');
+    }
+
+    const secUserId = storeResponse.data.sec_user_id;
+    console.log(`✅ User stored in Xordi: ${secUserId} (trust_level=0, encrypted cookies)`);
+
+    // Phase 3: Escalate trust level after verification
+    console.log('🔼 Escalating trust level...');
+
+    const escalateResponse = await axios.post(
+      `${xordiApiUrl}/api/enclave/escalate-trust`,
+      {
+        sec_user_id: secUserId,
+        pre_auth_token: preAuthToken,
+        tokscope_session_id: authSessionId
+      },
+      {
+        headers: {
+          'X-Api-Key': xordiApiKey,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    if (!escalateResponse.data.success) {
+      console.warn('⚠️ Trust escalation failed, user remains at trust_level=0');
+    } else {
+      console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
+    }
+
+    // Store in local session manager for immediate use
+    if (sessionManager) {
+      sessionManager.storeSession(sessionData);
+      console.log(`💾 Session also stored locally for immediate use`);
+    }
+
+  } catch (error: any) {
+    console.error('❌ TEE encryption/storage failed:', error.message);
+    throw error;
   }
 }
 
@@ -792,6 +883,177 @@ app.get('/containers', async (req, res) => {
   }
 });
 
+// ============================================================================
+// XORDI INTEGRATION ENDPOINTS
+// Request Construction Outside, Signing Inside TEE
+// ============================================================================
+
+/**
+ * Execute TikTok API request with authentication in TEE
+ * - Receives pre-constructed request packet from Xordi (NO secrets)
+ * - Retrieves TEE-encrypted cookies from Xordi DB
+ * - Decrypts cookies in TEE
+ * - Generates security headers via Python subprocess
+ * - Executes signed request to TikTok
+ * - Returns response (public video metadata)
+ */
+app.post('/api/tiktok/execute', async (req, res) => {
+  try {
+    const { sec_user_id, request } = req.body;
+
+    // 1. Verify Xordi API key
+    const apiKey = req.header('X-Api-Key');
+    const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter(k => k);
+
+    if (!apiKey || !allowedKeys.includes(apiKey)) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    // 2. Validate endpoint against whitelist (Trust Enforcement)
+    const ALLOWED_ENDPOINTS = {
+      read_only: [
+        '/aweme/v1/feed/',
+        '/aweme/v1/user/',
+        '/aweme/v1/search/item/'
+      ],
+      authenticated: [
+        '/aweme/v1/watch/history/'
+      ],
+      write_operations: [
+        '/aweme/v1/commit/item/digg/',
+        '/aweme/v1/commit/follow/user/'
+      ]
+    };
+
+    const allAllowed = [
+      ...ALLOWED_ENDPOINTS.read_only,
+      ...ALLOWED_ENDPOINTS.authenticated,
+      ...ALLOWED_ENDPOINTS.write_operations
+    ];
+
+    if (!allAllowed.includes(request.endpoint)) {
+      return res.status(403).json({
+        error: 'Endpoint not whitelisted',
+        endpoint: request.endpoint,
+        message: 'Only pre-approved TikTok API endpoints are allowed'
+      });
+    }
+
+    // 3. Get session data - try local session manager first, then Xordi DB
+    let sessionData: any = null;
+    let cookies: any[] = [];
+
+    // Try local session manager first (for immediate post-auth use)
+    const localSession = sessionManager?.getSession(sec_user_id);
+
+    if (localSession && localSession.cookies) {
+      sessionData = localSession;
+      cookies = localSession.cookies;
+      console.log(`📦 Using local session for ${sec_user_id.substring(0, 8)}...`);
+    } else {
+      // Retrieve TEE-encrypted cookies from Xordi DB
+      console.log(`🔍 Retrieving TEE-encrypted cookies from Xordi for ${sec_user_id.substring(0, 8)}...`);
+
+      const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
+      const xordiApiKey = process.env.XORDI_API_KEY;
+
+      if (!xordiApiKey) {
+        return res.status(500).json({ error: 'XORDI_API_KEY not configured' });
+      }
+
+      try {
+        const cookiesResponse = await axios.get(
+          `${xordiApiUrl}/api/enclave/get-encrypted-cookies/${sec_user_id}`,
+          {
+            headers: {
+              'X-Api-Key': xordiApiKey
+            }
+          }
+        );
+
+        if (!cookiesResponse.data.success) {
+          throw new Error('Failed to retrieve encrypted cookies from Xordi');
+        }
+
+        // Decrypt cookies IN TEE
+        console.log(`🔓 Decrypting cookies in TEE...`);
+        const encryptedHex = cookiesResponse.data.tee_encrypted_cookies;
+        cookies = teeCrypto.decryptCookies(encryptedHex);
+
+        // Build session data structure
+        sessionData = {
+          cookies,
+          tokens: {
+            device_id: cookiesResponse.data.device_id,
+            install_id: cookiesResponse.data.install_id
+          },
+          user: {
+            sec_user_id
+          }
+        };
+
+        console.log(`✅ Cookies decrypted successfully (${cookies.length} cookies)`);
+
+      } catch (error: any) {
+        console.error('Failed to retrieve/decrypt cookies:', error.message);
+        return res.status(500).json({ error: 'Failed to retrieve session data' });
+      }
+    }
+
+    if (!sessionData || !cookies || cookies.length === 0) {
+      return res.status(404).json({ error: 'No session data available for user' });
+    }
+
+    // 4. Build params string for signing
+    const paramsString = new URLSearchParams(request.params).toString();
+
+    // 5. Extract cookies as string
+    let cookieString = '';
+    if (cookies && Array.isArray(cookies)) {
+      cookieString = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+    }
+
+    // 6. Generate security headers via Python subprocess (IPC, not HTTP)
+    const stub = request.body ? crypto.createHash('md5').update(request.body).digest('hex') : '';
+
+    const headersResponse = await xordiSecurityModule.sendRequest('generateHeaders', {
+      params: paramsString,
+      cookies: cookieString,
+      stub: stub,
+      timestamp: Math.floor(Date.now() / 1000)
+    });
+
+    if (!headersResponse.success) {
+      throw new Error('Failed to generate security headers');
+    }
+
+    // 7. Execute HTTP request to TikTok (FROM TEE)
+    const tiktokResponse = await axios.request({
+      method: request.method,
+      url: `https://api16-normal-c-useast1a.tiktokv.com${request.endpoint}`,
+      params: request.params,
+      data: request.body,
+      headers: {
+        'Cookie': cookieString,  // ✅ Sent from TEE
+        'X-Gorgon': headersResponse.headers['X-Gorgon'],
+        'X-Khronos': headersResponse.headers['X-Khronos'],
+        'X-Argus': headersResponse.headers['X-Argus'],
+        'X-Ladon': headersResponse.headers['X-Ladon'],
+        'User-Agent': 'com.zhiliaoapp.musically/2023009040 (Linux; U; Android 13; en_US; Pixel 7; Build/TD1A.220804.031; Cronet/58.0.2991.0)'
+      }
+    });
+
+    // 8. Return response (public video metadata)
+    res.json(tiktokResponse.data);
+
+  } catch (error: any) {
+    console.error('TikTok request execution failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+
 const startTime = Date.now();
 
 app.get('/health', (req, res) => {
@@ -824,6 +1086,10 @@ async function startServer(): Promise<void> {
 
   moduleLoader = new EnclaveModuleLoader();
   console.log('🔒 Proprietary module loader initialized');
+
+  // Initialize Xordi security module (Python subprocess)
+  await xordiSecurityModule.initialize();
+  console.log('🔐 Xordi security module initialized');
 
   // Cleanup expired auth sessions periodically
   setInterval(() => {

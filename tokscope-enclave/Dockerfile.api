@@ -55,15 +55,25 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
     npm_config_cache=/npm-cache
 
 # FORCE ORDERING: Install system packages FIRST, then copy built code, then npm install
-# Step 1: System packages
+# Step 1: System packages (including Python for security service subprocess)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends socat=1.7.4.4-2 && \
+    apt-get install -y --no-install-recommends \
+        socat=1.7.4.4-2 \
+        python3 \
+        python3-pip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /var/log/apt/* && \
     rm -rf /var/log/dpkg.log && \
     rm -rf /var/log/alternatives.log && \
     rm -rf /var/cache/ldconfig/aux-cache
+
+# Step 1.5: Install Python packages for security service
+RUN pip3 install --no-cache-dir \
+    fastapi \
+    pydantic \
+    pycryptodome \
+    protobuf
 
 WORKDIR /app
 
@@ -77,6 +87,10 @@ COPY tokscope-enclave/package-lock.json ./package-lock.json
 RUN mkdir -p /npm-cache && \
     npm ci --omit=dev --ignore-scripts --prefer-offline --no-audit --fund=false && \
     rm -rf /npm-cache
+
+# Step 4: Copy Python security service for Xordi integration
+COPY tokscope-enclave/security-service/ ./security-service/
+COPY tokscope-enclave/xordi-security-module.js ./xordi-security-module.js
 
 # Start API server
 CMD ["node", "server.js"]
