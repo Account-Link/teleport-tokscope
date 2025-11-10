@@ -69,7 +69,7 @@ RUN apt-get update && \
     rm -rf /var/cache/ldconfig/aux-cache
 
 # Step 1.5: Install Python packages for security service
-RUN pip3 install --no-cache-dir \
+RUN pip3 install --no-cache-dir --break-system-packages \
     fastapi \
     pydantic \
     pycryptodome \
@@ -91,6 +91,7 @@ RUN mkdir -p /npm-cache && \
 # Step 4: Copy Python security service for Xordi integration
 COPY tokscope-enclave/security-service/ ./security-service/
 COPY tokscope-enclave/xordi-security-module.js ./xordi-security-module.js
+COPY tokscope-enclave/tee-crypto.js ./tee-crypto.js
 
 # Start API server
 CMD ["node", "server.js"]

@@ -6,11 +6,11 @@ import jsQR from 'jsqr';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 
-const BrowserAutomationClient = require('../dist/lib/browser-automation-client');
-const WebApiClient = require('../dist/lib/web-api-client');
-const { PublicApiClient } = require('../dist/lib/public-api-client');
-const { EnclaveModuleLoader } = require('../dist/lib/enclave-module-loader');
-const QRExtractor = require('../dist/lib/qr-extractor');
+const BrowserAutomationClient = require('./lib/browser-automation-client');
+const WebApiClient = require('./lib/web-api-client');
+const { PublicApiClient } = require('./lib/public-api-client');
+const { EnclaveModuleLoader } = require('./lib/enclave-module-loader');
+const QRExtractor = require('./lib/qr-extractor');
 const xordiSecurityModule = require('./xordi-security-module');
 const teeCrypto = require('./tee-crypto');
 
@@ -26,6 +26,7 @@ interface SessionData {
   cookies?: any[];
   tokens?: any;
   device_id?: string;
+  install_id?: string;
 }
 
 interface BrowserInstance {
@@ -242,7 +243,7 @@ async function initDStack(): Promise<void> {
 function encryptSessionData(data: SessionData): string {
   if (!encryptionKey) throw new Error('Encryption key not initialized');
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipher('aes-256-cbc', encryptionKey);
+  const cipher = crypto.createCipheriv('aes-256-cbc', encryptionKey, iv);
   cipher.setAutoPadding(true);
 
   let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'hex');
@@ -349,12 +350,17 @@ app.get('/sessions', (req, res) => {
 app.post('/auth/start/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
+    const { preAuthToken } = req.body;  // 🔥 NEW: Accept pre-auth token for TEE integration
 
     if (!authSessionManager) {
       return res.status(500).json({ error: 'Auth session manager not initialized' });
     }
 
-    console.log(`🔐 Starting authentication for session ${sessionId.substring(0, 8)}...`);
+    if (preAuthToken) {
+      console.log(`🔐 Starting TEE-integrated authentication for session ${sessionId.substring(0, 8)}... (pre-auth token provided)`);
+    } else {
+      console.log(`🔐 Starting legacy authentication for session ${sessionId.substring(0, 8)}... (no pre-auth token)`);
+    }
 
     // Create auth session
     const authSessionId = authSessionManager.createAuthSession(sessionId);
@@ -397,7 +403,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
 
         // Start polling for login completion
-        await waitForLoginCompletion(authSessionId, authPage);
+        // 🔥 NEW: Pass preAuthToken to enable TEE integration
+        await waitForLoginCompletion(authSessionId, authPage, preAuthToken);
 
       } catch (error: any) {
         console.error(`❌ Auth flow error for ${authSessionId}:`, error.message);
@@ -912,16 +919,17 @@ app.post('/api/tiktok/execute', async (req, res) => {
     // 2. Validate endpoint against whitelist (Trust Enforcement)
     const ALLOWED_ENDPOINTS = {
       read_only: [
-        '/aweme/v1/feed/',
-        '/aweme/v1/user/',
-        '/aweme/v1/search/item/'
+        '/aweme/v1/feed/',              // Mobile API: For You feed
+        '/aweme/v1/user/',              // Mobile API: User profile
+        '/aweme/v1/search/item/',       // Mobile API: Search
+        '/api/recommend/item_list/'     // Web API: For You feed (working implementation)
       ],
       authenticated: [
-        '/aweme/v1/watch/history/'
+        '/aweme/v1/watch/history/'      // Mobile API: Watch history
       ],
       write_operations: [
-        '/aweme/v1/commit/item/digg/',
-        '/aweme/v1/commit/follow/user/'
+        '/aweme/v1/commit/item/digg/',  // Mobile API: Like video
+        '/aweme/v1/commit/follow/user/' // Mobile API: Follow user
       ]
     };
 
@@ -931,10 +939,13 @@ app.post('/api/tiktok/execute', async (req, res) => {
       ...ALLOWED_ENDPOINTS.write_operations
     ];
 
-    if (!allAllowed.includes(request.endpoint)) {
+    // Extract base path (before query string) for whitelist check
+    const baseEndpoint = request.endpoint.split('?')[0];
+
+    if (!allAllowed.includes(baseEndpoint)) {
       return res.status(403).json({
         error: 'Endpoint not whitelisted',
-        endpoint: request.endpoint,
+        endpoint: baseEndpoint,
         message: 'Only pre-approved TikTok API endpoints are allowed'
       });
     }
@@ -1004,46 +1015,118 @@ app.post('/api/tiktok/execute', async (req, res) => {
       return res.status(404).json({ error: 'No session data available for user' });
     }
 
-    // 4. Build params string for signing
-    const paramsString = new URLSearchParams(request.params).toString();
+    // 4. Detect API type (web vs mobile)
+    const apiType = request.apiType || 'mobile';
+    const isWebApi = apiType === 'web';
 
-    // 5. Extract cookies as string
+    console.log(`🌐 API Type: ${apiType}`);
+
+    // 5. Extract cookies - different filtering for web vs mobile
     let cookieString = '';
     if (cookies && Array.isArray(cookies)) {
-      cookieString = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+      if (isWebApi) {
+        // Web API: Use all cookies
+        cookieString = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+        console.log(`🍪 Using ${cookies.length} web cookies`);
+      } else {
+        // Mobile API: Filter to mobile-only cookies
+        const mobileCookieNames = [
+          'sessionid', 'sessionid_ss',
+          'sid_guard', 'sid_tt',
+          'uid_tt', 'uid_tt_ss',
+          'msToken',
+          'tt_chain_token',
+          'sid_ucp_v1', 'ssid_ucp_v1',
+          'store-idc', 'store-country-code', 'store-country-code-src',
+          'tt-target-idc', 'tt-target-idc-sign',
+          'cmpl_token', 'multi_sids',
+          'tt_session_tlb_tag'
+        ];
+        const filteredCookies = cookies.filter((c: any) => mobileCookieNames.includes(c.name));
+        cookieString = filteredCookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+        console.log(`🍪 Filtered ${cookies.length} cookies → ${filteredCookies.length} mobile cookies`);
+      }
     }
 
-    // 6. Generate security headers via Python subprocess (IPC, not HTTP)
-    const stub = request.body ? crypto.createHash('md5').update(request.body).digest('hex') : '';
+    // 6. Build headers based on API type
+    let requestHeaders: any = {
+      'Cookie': cookieString
+    };
 
-    const headersResponse = await xordiSecurityModule.sendRequest('generateHeaders', {
-      params: paramsString,
-      cookies: cookieString,
-      stub: stub,
-      timestamp: Math.floor(Date.now() / 1000)
-    });
+    if (isWebApi) {
+      // Web API: Browser headers matching working v2.4 implementation
+      requestHeaders = {
+        ...requestHeaders,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.tiktok.com/foryou',
+        'Origin': 'https://www.tiktok.com',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin'
+      };
+    } else {
+      // Mobile API: Generate security headers via Python subprocess
+      const paramsString = new URLSearchParams(request.params).toString();
+      const stub = request.body ? crypto.createHash('md5').update(request.body).digest('hex') : '';
 
-    if (!headersResponse.success) {
-      throw new Error('Failed to generate security headers');
-    }
+      const headersResponse = await xordiSecurityModule.sendRequest('generateHeaders', {
+        params: paramsString,
+        cookies: cookieString,
+        stub: stub,
+        timestamp: Math.floor(Date.now() / 1000)
+      });
 
-    // 7. Execute HTTP request to TikTok (FROM TEE)
-    const tiktokResponse = await axios.request({
-      method: request.method,
-      url: `https://api16-normal-c-useast1a.tiktokv.com${request.endpoint}`,
-      params: request.params,
-      data: request.body,
-      headers: {
-        'Cookie': cookieString,  // ✅ Sent from TEE
+      if (!headersResponse.success) {
+        throw new Error('Failed to generate security headers');
+      }
+
+      requestHeaders = {
+        ...requestHeaders,
         'X-Gorgon': headersResponse.headers['X-Gorgon'],
         'X-Khronos': headersResponse.headers['X-Khronos'],
         'X-Argus': headersResponse.headers['X-Argus'],
         'X-Ladon': headersResponse.headers['X-Ladon'],
-        'User-Agent': 'com.zhiliaoapp.musically/2023009040 (Linux; U; Android 13; en_US; Pixel 7; Build/TD1A.220804.031; Cronet/58.0.2991.0)'
-      }
-    });
+        'User-Agent': `com.zhiliaoapp.musically/${request.params.manifest_version_code || '2023009040'} (Linux; U; Android ${request.params.os_version || '10'}; ${request.params.language || 'en'}_${request.params.region || 'US'}; ${request.params.device_type || 'SM-G973F'}; Build/QP1A.190711.020;tt-ok/3.12.13.4-tiktok)`
+      };
+    }
+
+    // 7. Execute HTTP request to TikTok (FROM TEE)
+    const baseUrl = isWebApi ? 'https://www.tiktok.com' : 'https://api16-normal-c-useast1a.tiktokv.com';
+
+    // For web API, endpoint already has query string; for mobile API, use params
+    const axiosConfig: any = {
+      method: request.method,
+      url: `${baseUrl}${request.endpoint}`,
+      data: request.body,
+      headers: requestHeaders,
+      timeout: 15000
+    };
+
+    // Only add params if not already in URL (mobile API uses params object)
+    if (!isWebApi && request.params && Object.keys(request.params).length > 0) {
+      axiosConfig.params = request.params;
+    }
+
+    // DEBUG: Log the exact request being made
+    console.log(`📤 REQUEST URL: ${axiosConfig.url}`);
+    console.log(`📤 REQUEST HEADERS:`, JSON.stringify(Object.keys(requestHeaders)));
+    console.log(`📤 COOKIE NAMES: ${cookies.map((c: any) => c.name).join(', ')}`);
+
+    const tiktokResponse = await axios.request(axiosConfig);
 
     // 8. Return response (public video metadata)
+    console.log(`✅ TikTok response status: ${tiktokResponse.status}`);
+    console.log(`📦 Response keys: ${Object.keys(tiktokResponse.data || {}).join(', ')}`);
+    if (isWebApi) {
+      console.log(`📊 itemList length: ${(tiktokResponse.data?.itemList || []).length}`);
+      if (!tiktokResponse.data?.itemList || tiktokResponse.data.itemList.length === 0) {
+        console.error(`⚠️ Empty response from TikTok. Full response:`, JSON.stringify(tiktokResponse.data));
+      }
+    }
     res.json(tiktokResponse.data);
 
   } catch (error: any) {

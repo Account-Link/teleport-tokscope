@@ -98,7 +98,7 @@ class PythonSecurityModule {
       this.pendingRequests.set(requestId, { resolve, reject });
 
       // Send request to Python subprocess
-      this.pythonProcess.stdin.write(JSON.dumps(request) + '\n');
+      this.pythonProcess.stdin.write(JSON.stringify(request) + '\n');
 
       // Timeout after 30 seconds
       setTimeout(() => {

@@ -47,7 +47,7 @@ class BrowserManager {
   async createContainer(): Promise<string> {
     const containerId = this.generateContainerId();
     const network = process.env.DOCKER_NETWORK || 'xordi-proprietary-modules_enclave-api-network';
-    const subnet = '172.22.0.0/24';
+    const subnet = process.env.DOCKER_SUBNET || '172.19.0.0/16';
 
     try {
       console.log(`🚀 Creating browser container: ${containerId}`);
@@ -63,17 +63,14 @@ class BrowserManager {
         }
       }
 
-      const baseIP = subnet.split('/')[0].split('.').slice(0, 3).join('.');
-      const containerIP = `${baseIP}.${100 + this.containers.size}`;
-
+      // Don't use static IPs - let Docker assign them automatically
+      // xordi-network doesn't have user-configured subnet
       const dockerCmd = [
         'docker', 'run', '-d',
         '--name', containerId,
         '--hostname', containerId,
         '--network', network,
-        '--ip', containerIP,
         '--env', `CONTAINER_NAME=${containerId}`,
-        '--env', `NEKO_NAT1TO1=${containerIP}`,
         '--restart', 'no',
         process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest'
       ];
@@ -110,6 +107,10 @@ class BrowserManager {
       if (retries >= 60) {
         throw new Error(`Container ${containerId} failed to start within 60 seconds`);
       }
+
+      // Get the container's IP address from Docker
+      const containerIP = execSync(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`, { encoding: 'utf8' }).trim();
+      console.log(`📍 Container IP: ${containerIP}`);
 
       const cdpUrl = `http://${containerIP}:9223`;
       let browser = null;

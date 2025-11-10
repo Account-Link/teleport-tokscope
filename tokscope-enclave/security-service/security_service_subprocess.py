@@ -12,14 +12,14 @@ import secrets
 from typing import Dict, Any
 from urllib.parse import urlencode
 
-# Add lib directory to path
-sys.path.insert(0, '/app/security-service/lib')
+# Add security-service directory to path so lib/ is a package
+sys.path.insert(0, '/app/security-service')
 
-# Import security modules
-from XGorgon import XGorgon
-from XArgus import Argus as XArgus
-from XLadon import Ladon as XLadon
-from TTEncrypt import TT as TTEncrypt
+# Import security modules from lib package
+from lib.XGorgon import XGorgon
+from lib.XArgus import Argus as XArgus
+from lib.XLadon import Ladon as XLadon
+from lib.TTEncrypt import TT as TTEncrypt
 
 # Configure logging to stderr (stdout used for IPC)
 logging.basicConfig(
@@ -42,25 +42,24 @@ class SecurityServiceSubprocess:
         try:
             # Build headers dict for XGorgon
             headers_dict = {'cookie': cookies} if cookies else {}
+            if stub:
+                headers_dict['x-ss-stub'] = stub
 
             # Generate X-Gorgon and X-Khronos
-            gorgon_result = self.gorgon.get_value(
+            gorgon_result = self.gorgon.calculate(
                 params=params,
-                data=None,
-                stub=stub,
-                headers_dict=headers_dict,
-                timestamp=timestamp
+                headers=headers_dict
             )
 
             # Generate X-Argus
-            argus_value = self.argus.get_value(
+            argus_value = self.argus.get_sign(
                 params=params,
-                cookies=cookies,
+                stub=stub,
                 timestamp=timestamp
             )
 
             # Generate X-Ladon
-            ladon_value = self.ladon.get_value(params)
+            ladon_value = self.ladon.encrypt(timestamp=timestamp)
 
             return {
                 'X-Gorgon': gorgon_result.get('X-Gorgon', ''),
