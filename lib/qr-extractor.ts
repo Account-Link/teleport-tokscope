@@ -12,7 +12,7 @@ class QRExtractor {
         if (canvas.width > 100 && canvas.height > 100) {
           try {
             const dataUrl = canvas.toDataURL('image/png');
-            if (dataUrl && dataUrl.length > 1000) {
+            if (dataUrl && dataUrl.length > 100) {
               return dataUrl;
             }
           } catch (e) {
