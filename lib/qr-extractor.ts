@@ -26,6 +26,12 @@ class QRExtractor {
         const src = img.src || '';
         const alt = img.alt || '';
 
+        // SKIP CDN images - they are static placeholders!
+        if (src.includes('tiktokcdn')) {
+          console.log('Skipping CDN image:', src.substring(0, 80));
+          continue;
+        }
+
         if (alt.toLowerCase().includes('qr') ||
             src.includes('qr') ||
             src.includes('qrcode')) {
