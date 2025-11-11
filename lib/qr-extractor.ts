@@ -6,10 +6,6 @@ class QRExtractor {
     try {
       console.log('Current page URL:', page.url());
 
-      // Take a screenshot for debugging
-      const screenshot = await page.screenshot({ encoding: 'base64' });
-      console.log('Page screenshot taken, length:', screenshot.length);
-
       // Wait specifically for canvas element (not images which might be CDN placeholders)
       try {
         await page.waitForSelector('canvas', {
@@ -22,8 +18,9 @@ class QRExtractor {
         console.log('No canvas found, page might be blocked or redirected');
       }
 
-      // Try multiple extraction methods - also get imageData for decoding
-      const qrData = await page.evaluate(() => {
+      // Helper function to attempt QR extraction from DOM
+      const attemptExtraction = async () => {
+        return await page.evaluate(() => {
         // Method 1: Canvas element (get both dataUrl and imageData)
         const canvases = document.querySelectorAll('canvas');
         console.log(`Found ${canvases.length} canvas elements`);
@@ -34,6 +31,7 @@ class QRExtractor {
               if (dataUrl && dataUrl.length > 100) {
                 // Also get imageData for QR decoding
                 const ctx = canvas.getContext('2d');
+                if (!ctx) continue;
                 const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
                 return {
                   dataUrl: dataUrl,
@@ -80,12 +78,25 @@ class QRExtractor {
           }
         }
 
-        return null;
-      });
+          return null;
+        });
+      };
 
+      // First attempt at extraction
+      let qrData = await attemptExtraction();
+
+      // If first attempt failed, wait and retry once
       if (!qrData) {
-        // Return the screenshot as fallback
-        console.log('No QR found in DOM, using screenshot as fallback');
+        console.log('⚠️ First extraction attempt failed, waiting 2 seconds and retrying...');
+        await page.waitForTimeout(2000);
+        qrData = await attemptExtraction();
+      }
+
+      // If retry also failed, take screenshot as final fallback
+      if (!qrData) {
+        console.log('❌ Retry also failed, taking screenshot as final fallback');
+        const screenshotBuffer = await page.screenshot();
+        const screenshot = screenshotBuffer.toString('base64');
         return {
           image: `data:image/png;base64,${screenshot}`,
           decodedUrl: null
@@ -125,7 +136,9 @@ class QRExtractor {
         console.log('⚠️ WARNING: Got CDN image URL instead of QR data:', qrData.dataUrl.substring(0, 100));
         console.log('This likely means the QR code is not properly rendered yet');
 
-        // Don't return CDN images as they're not real QR codes
+        // Don't return CDN images as they're not real QR codes - take screenshot as fallback
+        const screenshotBuffer = await page.screenshot();
+        const screenshot = screenshotBuffer.toString('base64');
         return {
           image: `data:image/png;base64,${screenshot}`,
           decodedUrl: null,
