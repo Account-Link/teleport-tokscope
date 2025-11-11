@@ -394,13 +394,17 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           timeout: 30000
         });
 
-        await authPage.waitForTimeout(3000);
-
         // Extract and decode QR code
-        const qrDataUrl = await QRExtractor.extractQRCodeFromPage(authPage);
-        authSessionManager.updateAuthSession(authSessionId, { qrCodeData: qrDataUrl });
+        const qrData = await QRExtractor.extractQRCodeFromPage(authPage);
+        authSessionManager.updateAuthSession(authSessionId, { qrCodeData: qrData.image });
 
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
+        if (qrData.decodedUrl) {
+          console.log(`🔗 QR URL validated: ${qrData.decodedUrl}`);
+        }
+        if (qrData.error) {
+          console.log(`⚠️ QR extraction warning: ${qrData.error}`);
+        }
 
         // Start polling for login completion
         // 🔥 NEW: Pass preAuthToken to enable TEE integration

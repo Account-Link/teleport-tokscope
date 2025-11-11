@@ -236,21 +236,21 @@ app.post('/api/auth/start', async (req, res) => {
     await page.waitForTimeout(3000);
 
     // Extract QR code
-    const qrData = await QRExtractor.extractQRCodeFromPage(page);
-    if (!qrData) {
+    const qrResult = await QRExtractor.extractQRCodeFromPage(page);
+    if (!qrResult || !qrResult.image) {
       throw new Error('Could not extract QR code');
     }
 
     authState = {
       browser,
       page,
-      qrData,
+      qrData: qrResult.image,
       status: 'awaiting_scan',
       startTime: Date.now()
     };
 
     console.log('✅ QR code ready');
-    res.json({ status: 'awaiting_scan', qrData });
+    res.json({ status: 'awaiting_scan', qrData: qrResult.image });
 
   } catch (error) {
     console.error('❌ Auth start failed:', error.message);

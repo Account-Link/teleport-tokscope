@@ -571,11 +571,12 @@ class XordiDevTool {
   async showQRCode() {
     console.log('📱 Extracting QR code...');
 
-    const qrData = await this.extractQRCodeFromPage();
-    if (!qrData) {
+    const qrResult = await this.extractQRCodeFromPage();
+    if (!qrResult || !qrResult.image) {
       throw new Error('Could not extract QR code from page');
     }
 
+    const qrData = qrResult.image;
     await this.startQRServer(qrData);
 
     // Display QR code as ASCII art in terminal
