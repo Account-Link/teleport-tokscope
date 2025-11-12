@@ -21,6 +21,25 @@ class QRExtractor {
       // Helper function to attempt QR extraction from DOM
       const attemptExtraction = async () => {
         return await page.evaluate(() => {
+        // DEBUG: Log entire document structure
+        console.log('=== DOM INSPECTION ===');
+        console.log('Document title:', document.title);
+        console.log('Page readyState:', document.readyState);
+        console.log('Total elements:', document.querySelectorAll('*').length);
+        console.log('Canvas elements:', document.querySelectorAll('canvas').length);
+        console.log('IMG elements:', document.querySelectorAll('img').length);
+        console.log('DIVs with "qr":', document.querySelectorAll('[class*="qr"], [id*="qr"]').length);
+        console.log('Body innerHTML length:', document.body?.innerHTML?.length || 0);
+
+        // Log first few elements that might be QR-related
+        const qrRelated = document.querySelectorAll('[class*="qr"], [id*="qr"], [class*="QR"], [id*="QR"]');
+        console.log('QR-related elements:', Array.from(qrRelated).map(el => ({
+          tag: el.tagName,
+          id: el.id,
+          class: el.className
+        })));
+        console.log('==================');
+
         // Method 1: Canvas element (get both dataUrl and imageData)
         const canvases = document.querySelectorAll('canvas');
         console.log(`Found ${canvases.length} canvas elements`);

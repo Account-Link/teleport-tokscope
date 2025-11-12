@@ -71,6 +71,8 @@ class BrowserManager {
         '--hostname', containerId,
         '--network', network,
         '--env', `CONTAINER_NAME=${containerId}`,
+        '--env', `NEKO_DESKTOP_SCREEN=${process.env.NEKO_DESKTOP_SCREEN || '1920x1080@30'}`,
+        '--env', `NEKO_DESKTOP_SCALING=${process.env.NEKO_DESKTOP_SCALING || '1.0'}`,
         '--restart', 'no',
         process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest'
       ];
