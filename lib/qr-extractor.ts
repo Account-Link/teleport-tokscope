@@ -90,32 +90,29 @@ class QRExtractor {
           }
         }
 
-        // Method 2: Image elements (for fallback, just return dataUrl)
+        // Method 2: Image elements - CHECK ALL IMAGES (including tiktokcdn!)
+        // TikTok now serves QR codes as tiktokcdn img tags, not canvas!
         const images = document.querySelectorAll('img');
         console.log(`Found ${images.length} img elements`);
+
+        // First: Look for images with QR-related keywords
         for (const img of images) {
           const src = img.src || '';
           const alt = img.alt || '';
-          // SKIP CDN images - they are static placeholders!
-          if (src.includes('tiktokcdn')) {
-            console.log('Skipping CDN image:', src.substring(0, 80));
-            continue;
-          }
           if (src && (alt.toLowerCase().includes('qr') ||
                       src.includes('qr') ||
                       src.includes('qrcode') ||
                       src.includes('barcode'))) {
+            console.log('Found QR-related image:', src.substring(0, 100));
             return { dataUrl: src, imageData: null };
           }
         }
 
         // Method 3: Check all images that look like QR codes (square aspect ratio)
+        // This catches tiktokcdn QR images even if they don't have "qr" in the name
         for (const img of images) {
-          // SKIP CDN images - they are static placeholders!
-          if (img.src && img.src.includes('tiktokcdn')) {
-            continue;
-          }
           if (img.src && img.naturalWidth === img.naturalHeight && img.naturalWidth > 100) {
+            console.log('Found square image (likely QR):', img.src.substring(0, 100), `${img.naturalWidth}x${img.naturalHeight}`);
             return { dataUrl: img.src, imageData: null };
           }
         }
