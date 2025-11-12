@@ -90,30 +90,49 @@ class QRExtractor {
           }
         }
 
-        // Method 2: Image elements - CHECK ALL IMAGES (including tiktokcdn!)
+        // Method 2: Image elements - DECODE ALL SQUARE IMAGES to verify they're login QR codes
         // TikTok now serves QR codes as tiktokcdn img tags, not canvas!
         const images = document.querySelectorAll('img');
         console.log(`Found ${images.length} img elements`);
 
-        // First: Look for images with QR-related keywords
+        // Check all square images (potential QR codes) and DECODE them
         for (const img of images) {
-          const src = img.src || '';
-          const alt = img.alt || '';
-          if (src && (alt.toLowerCase().includes('qr') ||
-                      src.includes('qr') ||
-                      src.includes('qrcode') ||
-                      src.includes('barcode'))) {
-            console.log('Found QR-related image:', src.substring(0, 100));
-            return { dataUrl: src, imageData: null };
-          }
-        }
+          // Only check images that could be QR codes (square, reasonable size)
+          if (!img.src || !img.complete || img.naturalWidth < 100) continue;
+          if (img.naturalWidth !== img.naturalHeight) continue; // QR codes are square
 
-        // Method 3: Check all images that look like QR codes (square aspect ratio)
-        // This catches tiktokcdn QR images even if they don't have "qr" in the name
-        for (const img of images) {
-          if (img.src && img.naturalWidth === img.naturalHeight && img.naturalWidth > 100) {
-            console.log('Found square image (likely QR):', img.src.substring(0, 100), `${img.naturalWidth}x${img.naturalHeight}`);
-            return { dataUrl: img.src, imageData: null };
+          try {
+            // Draw image to canvas to get imageData for decoding
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (!ctx) continue;
+
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            ctx.drawImage(img, 0, 0);
+
+            // Get imageData for QR decoding
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+            // Try to get dataUrl too
+            const dataUrl = canvas.toDataURL('image/png');
+
+            console.log(`Checking square image: ${img.src.substring(0, 100)} (${img.naturalWidth}x${img.naturalHeight})`);
+
+            return {
+              dataUrl: dataUrl || img.src,
+              imageData: {
+                data: Array.from(imageData.data),
+                width: imageData.width,
+                height: imageData.height
+              }
+            };
+          } catch (e) {
+            console.log('Failed to extract imageData from img:', e);
+            // If canvas extraction fails, return the src as fallback
+            if (img.src) {
+              return { dataUrl: img.src, imageData: null };
+            }
           }
         }
 
