@@ -20,26 +20,39 @@ class QRExtractor {
 
       // Helper function to attempt QR extraction from DOM
       const attemptExtraction = async () => {
-        return await page.evaluate(() => {
-        // DEBUG: Log entire document structure
-        console.log('=== DOM INSPECTION ===');
-        console.log('Document title:', document.title);
-        console.log('Page readyState:', document.readyState);
-        console.log('Total elements:', document.querySelectorAll('*').length);
-        console.log('Canvas elements:', document.querySelectorAll('canvas').length);
-        console.log('IMG elements:', document.querySelectorAll('img').length);
-        console.log('DIVs with "qr":', document.querySelectorAll('[class*="qr"], [id*="qr"]').length);
-        console.log('Body innerHTML length:', document.body?.innerHTML?.length || 0);
+        // Get DOM inspection data
+        const domInspection = await page.evaluate(() => {
+          const qrRelated = document.querySelectorAll('[class*="qr"], [id*="qr"], [class*="QR"], [id*="QR"]');
+          return {
+            title: document.title,
+            readyState: document.readyState,
+            totalElements: document.querySelectorAll('*').length,
+            canvasCount: document.querySelectorAll('canvas').length,
+            imgCount: document.querySelectorAll('img').length,
+            qrRelatedCount: qrRelated.length,
+            bodyLength: document.body?.innerHTML?.length || 0,
+            qrElements: Array.from(qrRelated).slice(0, 5).map(el => ({
+              tag: el.tagName,
+              id: el.id,
+              class: el.className
+            }))
+          };
+        });
 
-        // Log first few elements that might be QR-related
-        const qrRelated = document.querySelectorAll('[class*="qr"], [id*="qr"], [class*="QR"], [id*="QR"]');
-        console.log('QR-related elements:', Array.from(qrRelated).map(el => ({
-          tag: el.tagName,
-          id: el.id,
-          class: el.className
-        })));
+        // Log it in Node.js context (will show in docker logs)
+        console.log('=== DOM INSPECTION ===');
+        console.log('Document title:', domInspection.title);
+        console.log('Page readyState:', domInspection.readyState);
+        console.log('Total elements:', domInspection.totalElements);
+        console.log('Canvas elements:', domInspection.canvasCount);
+        console.log('IMG elements:', domInspection.imgCount);
+        console.log('QR-related elements:', domInspection.qrRelatedCount);
+        console.log('Body innerHTML length:', domInspection.bodyLength);
+        console.log('QR elements sample:', JSON.stringify(domInspection.qrElements, null, 2));
         console.log('==================');
 
+        // Now do actual extraction
+        return await page.evaluate(() => {
         // Method 1: Canvas element (get both dataUrl and imageData)
         const canvases = document.querySelectorAll('canvas');
         console.log(`Found ${canvases.length} canvas elements`);
