@@ -6,16 +6,35 @@ class QRExtractor {
     try {
       console.log('Current page URL:', page.url());
 
-      // Wait specifically for canvas element (not images which might be CDN placeholders)
+      // Wait for the page to be fully loaded
       try {
-        await page.waitForSelector('canvas', {
-          timeout: 8000,
-          state: 'visible'
-        });
-        console.log('Canvas element found, waiting for render...');
-        await page.waitForTimeout(1000); // Give canvas time to render content
+        await page.waitForLoadState('networkidle', { timeout: 10000 });
+        console.log('Page network idle, waiting for QR to load...');
       } catch (err) {
-        console.log('No canvas found, page might be blocked or redirected');
+        console.log('Network idle timeout, proceeding anyway...');
+      }
+
+      // Wait for IMG src to change from placeholder to actual QR
+      // Placeholder: c4c40812758dc8175106.png
+      // Real QR: will be different (data URL or different CDN URL)
+      try {
+        await page.waitForFunction(() => {
+          const imgs = document.querySelectorAll('img');
+          for (const img of imgs) {
+            if (img.naturalWidth > 100 && img.naturalWidth === img.naturalHeight) {
+              // Check if it's NOT the placeholder
+              if (!img.src.includes('c4c40812758dc8175106.png') &&
+                  !img.src.includes('webapp-login-page')) {
+                return true;
+              }
+            }
+          }
+          return false;
+        }, { timeout: 10000 });
+        console.log('Real QR image detected (not placeholder)');
+        await page.waitForTimeout(1000); // Extra time for full load
+      } catch (err) {
+        console.log('⚠️ Timeout waiting for real QR, attempting extraction anyway...');
       }
 
       // Helper function to attempt QR extraction from DOM
@@ -142,6 +161,8 @@ class QRExtractor {
 
       // First attempt at extraction
       let qrData = await attemptExtraction();
+      let validationAttempts = 0;
+      const maxValidationAttempts = 3;
 
       // If first attempt failed, wait and retry once
       if (!qrData) {
@@ -161,9 +182,53 @@ class QRExtractor {
         };
       }
 
-      // Try to decode the QR code if we have imageData
-      let decodedUrl = null;
-      if (qrData.imageData) {
+      // Validate QR in a loop with retries
+      while (validationAttempts < maxValidationAttempts) {
+        validationAttempts++;
+        console.log(`Validation attempt ${validationAttempts}/${maxValidationAttempts}`);
+
+        const validationResult = await validateQRData(qrData);
+
+        if (validationResult.valid) {
+          console.log('✅ QR validation passed!');
+          return {
+            image: qrData.dataUrl,
+            decodedUrl: validationResult.decodedUrl
+          };
+        }
+
+        console.log(`⚠️ Validation failed: ${validationResult.reason}`);
+
+        if (validationAttempts < maxValidationAttempts) {
+          console.log(`Waiting 3 seconds for real QR to load, then retrying...`);
+          await page.waitForTimeout(3000);
+          qrData = await attemptExtraction();
+          if (!qrData) {
+            console.log('❌ Re-extraction failed');
+            break;
+          }
+        }
+      }
+
+      // All validation attempts failed
+      console.log('❌ All validation attempts exhausted, taking screenshot fallback');
+      const screenshotBuffer = await page.screenshot();
+      const screenshot = screenshotBuffer.toString('base64');
+      return {
+        image: `data:image/png;base64,${screenshot}`,
+        decodedUrl: null,
+        error: 'QR validation failed after multiple attempts'
+      };
+
+      // Helper function to validate QR data
+      async function validateQRData(qrData: any): Promise<{ valid: boolean, decodedUrl: string | null, reason?: string }> {
+        // Try to decode the QR code if we have imageData
+        let decodedUrl = null;
+
+        if (!qrData.imageData) {
+          return { valid: false, decodedUrl: null, reason: 'No imageData available' };
+        }
+
         try {
           const code = jsQR(
             new Uint8ClampedArray(qrData.imageData.data),
@@ -171,44 +236,48 @@ class QRExtractor {
             qrData.imageData.height
           );
 
-          if (code) {
-            decodedUrl = code.data;
-            console.log('✅ QR code decoded successfully');
-            console.log(`🔗 QR URL: ${decodedUrl}`);
-
-            // Validate it's a TikTok login URL
-            if (!decodedUrl.includes('tiktok.com')) {
-              console.log('⚠️ WARNING: Decoded URL is not a TikTok URL:', decodedUrl);
-              decodedUrl = null;
-            }
-          } else {
-            console.log('⚠️ Could not decode QR code');
+          if (!code) {
+            return { valid: false, decodedUrl: null, reason: 'Could not decode QR code' };
           }
+
+          decodedUrl = code.data;
+          console.log('✅ QR code decoded successfully');
+          console.log(`🔗 QR URL: ${decodedUrl}`);
+
+          // Validate it's a TikTok LOGIN URL (not download/promotional)
+          const isTikTokDomain = decodedUrl.includes('tiktok.com');
+          const isLoginQR = decodedUrl.includes('/t/') || // Short link for login
+                           decodedUrl.includes('/login/') ||
+                           decodedUrl.includes('/qr/authorize') ||
+                           decodedUrl.includes('/authorize?');
+          const isDownloadQR = decodedUrl.includes('/download-link/') ||
+                              decodedUrl.includes('/download') ||
+                              decodedUrl.includes('apps.apple.com') ||
+                              decodedUrl.includes('play.google.com') ||
+                              decodedUrl.includes('oneink.me'); // oneink.me is promotional
+
+          console.log(`   isTikTokDomain=${isTikTokDomain}, isLoginQR=${isLoginQR}, isDownloadQR=${isDownloadQR}`);
+
+          if (!isTikTokDomain) {
+            return { valid: false, decodedUrl: null, reason: `Not a TikTok domain: ${decodedUrl}` };
+          }
+
+          if (!isLoginQR) {
+            return { valid: false, decodedUrl: null, reason: `Not a login QR pattern: ${decodedUrl}` };
+          }
+
+          if (isDownloadQR) {
+            return { valid: false, decodedUrl: null, reason: `Download/promotional QR: ${decodedUrl}` };
+          }
+
+          // All checks passed!
+          return { valid: true, decodedUrl: decodedUrl };
+
         } catch (decodeError) {
           console.error('QR decode error:', decodeError);
+          return { valid: false, decodedUrl: null, reason: `Decode error: ${decodeError}` };
         }
       }
-
-      // Check if we got a CDN image instead of actual QR data
-      if (qrData.dataUrl && qrData.dataUrl.includes('tiktokcdn')) {
-        console.log('⚠️ WARNING: Got CDN image URL instead of QR data:', qrData.dataUrl.substring(0, 100));
-        console.log('This likely means the QR code is not properly rendered yet');
-
-        // Don't return CDN images as they're not real QR codes - take screenshot as fallback
-        const screenshotBuffer = await page.screenshot();
-        const screenshot = screenshotBuffer.toString('base64');
-        return {
-          image: `data:image/png;base64,${screenshot}`,
-          decodedUrl: null,
-          error: 'Got static CDN image instead of dynamic QR'
-        };
-      }
-
-      console.log('QR data extracted, image length:', qrData.dataUrl?.length || 0);
-      return {
-        image: qrData.dataUrl,
-        decodedUrl: decodedUrl
-      };
 
     } catch (error) {
       console.error('QR extraction failed:', error);
