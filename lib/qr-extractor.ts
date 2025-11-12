@@ -23,18 +23,27 @@ class QRExtractor {
         // Get DOM inspection data
         const domInspection = await page.evaluate(() => {
           const qrRelated = document.querySelectorAll('[class*="qr"], [id*="qr"], [class*="QR"], [id*="QR"]');
+          const allImages = document.querySelectorAll('img');
           return {
             title: document.title,
             readyState: document.readyState,
             totalElements: document.querySelectorAll('*').length,
             canvasCount: document.querySelectorAll('canvas').length,
-            imgCount: document.querySelectorAll('img').length,
+            imgCount: allImages.length,
             qrRelatedCount: qrRelated.length,
             bodyLength: document.body?.innerHTML?.length || 0,
             qrElements: Array.from(qrRelated).slice(0, 5).map(el => ({
               tag: el.tagName,
               id: el.id,
               class: el.className
+            })),
+            // LOG ALL IMAGES - especially that 1 IMG!
+            allImagesInfo: Array.from(allImages).map(img => ({
+              src: img.src?.substring(0, 150),
+              alt: img.alt,
+              width: img.naturalWidth,
+              height: img.naturalHeight,
+              class: img.className
             }))
           };
         });
@@ -49,6 +58,7 @@ class QRExtractor {
         console.log('QR-related elements:', domInspection.qrRelatedCount);
         console.log('Body innerHTML length:', domInspection.bodyLength);
         console.log('QR elements sample:', JSON.stringify(domInspection.qrElements, null, 2));
+        console.log('ALL IMAGES INFO:', JSON.stringify(domInspection.allImagesInfo, null, 2));
         console.log('==================');
 
         // Now do actual extraction
