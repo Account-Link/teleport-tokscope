@@ -50,6 +50,7 @@ interface AuthSession {
   containerId: string | null;
   status: 'awaiting_scan' | 'complete' | 'failed';
   qrCodeData: string | null;
+  qrDecodedUrl?: string | null;  // Magic link URL
   sessionData: SessionData | null;
   startedAt: number;
 }
@@ -411,7 +412,10 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 
         // Extract and decode QR code
         const qrData = await QRExtractor.extractQRCodeFromPage(authPage);
-        authSessionManager.updateAuthSession(authSessionId, { qrCodeData: qrData.image });
+        authSessionManager.updateAuthSession(authSessionId, {
+          qrCodeData: qrData.image,
+          qrDecodedUrl: qrData.decodedUrl  // Store the magic link URL
+        });
 
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
         if (qrData.decodedUrl) {
@@ -622,7 +626,8 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
     if (authSession.status === 'awaiting_scan') {
       res.json({
         status: 'awaiting_scan',
-        qrCodeData: authSession.qrCodeData
+        qrCodeData: authSession.qrCodeData,
+        qrDecodedUrl: authSession.qrDecodedUrl  // Include magic link
       });
     } else if (authSession.status === 'complete') {
       res.json({

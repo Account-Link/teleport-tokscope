@@ -82,6 +82,17 @@ class BrowserManager {
         '--restart', 'no'
       ];
 
+      // Resource limits (configurable via env vars)
+      if (process.env.BROWSER_CPU_LIMIT) {
+        dockerCmd.push('--cpus', process.env.BROWSER_CPU_LIMIT);
+      }
+      if (process.env.BROWSER_MEMORY_LIMIT) {
+        dockerCmd.push('--memory', process.env.BROWSER_MEMORY_LIMIT);
+      }
+      if (process.env.BROWSER_MEMORY_RESERVATION) {
+        dockerCmd.push('--memory-reservation', process.env.BROWSER_MEMORY_RESERVATION);
+      }
+
       // VPN proxy configuration (random bucket for QR auth load balancing)
       if (process.env.ENABLE_VPN_ROUTING === 'true') {
         // Random bucket selection (0-3) for load balancing across Chisel tunnels
