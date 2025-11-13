@@ -351,6 +351,14 @@ class BrowserManager {
     }
   }
 
+  getContainerBySession(sessionId: string): string | undefined {
+    return this.sessionToContainer.get(sessionId);
+  }
+
+  getPoolSize(): number {
+    return this.containerPool.length;
+  }
+
   getStats(): { total: number; available: number; assigned: number; sessions: number } {
     let available = 0;
     let assigned = 0;
@@ -424,11 +432,7 @@ async function main() {
     try {
       const { sessionId } = req.params;
 
-      if (!browserManager.isInitialized) {
-        return res.status(500).json({ error: 'Browser Manager not initialized' });
-      }
-
-      const containerId = browserManager.sessionToContainer.get(sessionId);
+      const containerId = browserManager.getContainerBySession(sessionId);
 
       if (containerId) {
         await browserManager.destroyContainer(containerId);
@@ -455,17 +459,13 @@ async function main() {
     }
   });
 
-  // Pre-warm container pool
+  // Pre-warm container pool (optional - pool maintenance auto-fills)
   app.post('/warmup', async (req, res) => {
     try {
       const { poolSize } = req.body;
       const targetSize = poolSize || MIN_POOL_SIZE;
 
       console.log(`🔥 Warmup request received: create ${targetSize} containers`);
-
-      if (!browserManager.isInitialized) {
-        return res.status(500).json({ error: 'Browser Manager not initialized' });
-      }
 
       const results = {
         requested: targetSize,
@@ -478,7 +478,8 @@ async function main() {
       for (let i = 0; i < targetSize; i++) {
         try {
           const containerId = await browserManager.createContainer();
-          browserManager.containerPool.push(containerId);
+          // Add to pool via releaseContainer to maintain pool properly
+          await browserManager.releaseContainer(`warmup-${Date.now()}-${i}`);
           results.created++;
           console.log(`✅ Warmed container ${i + 1}/${targetSize}: ${containerId.substring(0, 16)}...`);
         } catch (error: any) {
@@ -492,7 +493,7 @@ async function main() {
 
       res.json({
         success: results.created > 0,
-        poolSize: browserManager.containerPool.length,
+        poolSize: browserManager.getPoolSize(),
         results
       });
 
