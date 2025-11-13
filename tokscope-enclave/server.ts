@@ -466,12 +466,49 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 
   while (Date.now() - startTime < timeout) {
     try {
+      // PRIMARY: Check for sessionid cookie (fast - detects login immediately after mobile scan)
+      const cookies = await page.context().cookies();
+      const sessionIdCookie = cookies.find(c => c.name === 'sessionid');
+
+      if (sessionIdCookie && sessionIdCookie.value && sessionIdCookie.value.length > 10) {
+        console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}... (detected via sessionid cookie)`);
+
+        // Extract session data (cookies in plaintext - INSIDE TEE)
+        const sessionData = await extractAuthData(page);
+
+        authSessionManager!.updateAuthSession(authSessionId, {
+          status: 'complete',
+          sessionData
+        });
+
+        // TEE Integration: Encrypt and store via Xordi
+        if (preAuthToken && sessionData) {
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+        } else {
+          // Legacy flow: Store session locally (fallback)
+          if (sessionManager && sessionData) {
+            const newSessionId = sessionManager.storeSession(sessionData);
+            console.log(`💾 Session stored locally: ${newSessionId.substring(0, 8)}...`);
+          }
+        }
+
+        // Destroy auth container (auth containers should never be reused)
+        try {
+          await destroyBrowserInstance(authSessionId);
+        } catch (destroyError) {
+          console.error(`⚠️ Failed to destroy auth container for ${authSessionId}`);
+        }
+
+        return;
+      }
+
+      // FALLBACK: Check URL change (slow - backup detection method)
       const url = page.url();
 
       if (url.includes('/foryou') ||
           url.includes('/home') ||
           (url.includes('tiktok.com') && !url.includes('/login'))) {
-        console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}...`);
+        console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}... (detected via URL navigation)`);
 
         // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
