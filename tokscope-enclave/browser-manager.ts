@@ -19,7 +19,7 @@ interface ContainerInfo {
   browser: Browser | null;
   createdAt: number;
   lastUsed: number;
-  status: 'available' | 'assigned';
+  status: 'pooled' | 'assigned' | 'released';
   sessionId: string | null;
 }
 
@@ -154,7 +154,7 @@ class BrowserManager {
         browser,
         createdAt: Date.now(),
         lastUsed: Date.now(),
-        status: 'available',
+        status: 'pooled',
         sessionId: null
       };
 
@@ -226,12 +226,12 @@ class BrowserManager {
     const containerInfo = this.containers.get(containerId);
 
     if (containerInfo) {
-      containerInfo.status = 'available';
+      containerInfo.status = 'released';
       containerInfo.sessionId = null;
       containerInfo.lastUsed = Date.now();
 
-      this.containerPool.push(containerId);
-      console.log(`🔓 Released container ${containerId.substring(0, 16)}... from session ${sessionId.substring(0, 8)}...`);
+      // Don't return to pool - mark as 'released' for cleanup to destroy later
+      console.log(`🔓 Released container ${containerId.substring(0, 16)}... from session ${sessionId.substring(0, 8)}... (will be cleaned up)`);
     }
 
     this.sessionToContainer.delete(sessionId);
@@ -280,7 +280,8 @@ class BrowserManager {
       const toDestroy: string[] = [];
 
       for (const [containerId, containerInfo] of this.containers.entries()) {
-        if (containerInfo.status === 'available' && now - containerInfo.lastUsed > timeoutMs) {
+        // Only destroy 'released' containers (used and returned), NOT 'pooled' (warm pool)
+        if (containerInfo.status === 'released' && now - containerInfo.lastUsed > timeoutMs) {
           toDestroy.push(containerId);
         }
       }
@@ -308,7 +309,7 @@ class BrowserManager {
         for (let i = 0; i < needed; i++) {
           try {
             const containerId = await this.createContainer();
-            this.containerPool.push(containerId);
+            // Don't push here - createContainer() already added it to pool (line 162)
             console.log(`✅ Pool replenished: ${containerId.substring(0, 16)}... (${this.containerPool.length}/${MIN_POOL_SIZE})`);
           } catch (error: any) {
             console.error(`❌ Failed to create maintenance container:`, error.message);
@@ -364,7 +365,7 @@ class BrowserManager {
     let assigned = 0;
 
     for (const containerInfo of this.containers.values()) {
-      if (containerInfo.status === 'available') available++;
+      if (containerInfo.status === 'pooled' || containerInfo.status === 'released') available++;
       else assigned++;
     }
 
