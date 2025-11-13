@@ -315,23 +315,20 @@ class BrowserManager {
 
       if (currentPoolSize < MIN_POOL_SIZE) {
         const needed = MIN_POOL_SIZE - currentPoolSize;
-        console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
+        console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers in parallel...`);
 
-        for (let i = 0; i < needed; i++) {
-          // Check pool size BEFORE each creation (prevents race condition)
-          if (this.containerPool.length >= MIN_POOL_SIZE) {
-            console.log(`✅ Pool target reached (${this.containerPool.length}/${MIN_POOL_SIZE}), stopping creation`);
-            break;
-          }
-
+        // Create containers in parallel for faster pool initialization
+        const creationPromises = Array(needed).fill(null).map(async () => {
           try {
             const containerId = await this.createContainer();
-            // Don't push here - createContainer() already added it to pool (line 162)
             console.log(`✅ Pool replenished: ${containerId.substring(0, 16)}... (${this.containerPool.length}/${MIN_POOL_SIZE})`);
           } catch (error: any) {
             console.error(`❌ Failed to create maintenance container:`, error.message);
           }
-        }
+        });
+
+        await Promise.all(creationPromises);
+        console.log(`✅ Pool maintenance complete: ${this.containerPool.length}/${MIN_POOL_SIZE} containers ready`);
       }
     }, CHECK_INTERVAL_MS);
 
