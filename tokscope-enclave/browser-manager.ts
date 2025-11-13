@@ -33,6 +33,7 @@ class BrowserManager {
   private sessionToContainer = new Map<string, string>();
   private containerPool: string[] = [];
   private isInitialized = false;
+  private isMaintenanceRunning = false; // NEW: Lock flag for pool maintenance
 
   initialize(): void {
     this.isInitialized = true;
@@ -311,27 +312,51 @@ class BrowserManager {
     const CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
 
     setInterval(async () => {
-      const currentPoolSize = this.containerPool.length;
+      // LOCK: Prevent multiple maintenance cycles from running concurrently
+      if (this.isMaintenanceRunning) {
+        console.log('⏭️  Pool maintenance already running, skipping cycle...');
+        return;
+      }
 
-      if (currentPoolSize < MIN_POOL_SIZE) {
-        const needed = MIN_POOL_SIZE - currentPoolSize;
-        console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
+      this.isMaintenanceRunning = true;
 
-        for (let i = 0; i < needed; i++) {
-          // Check pool size BEFORE each creation (prevents race condition)
-          if (this.containerPool.length >= MIN_POOL_SIZE) {
-            console.log(`✅ Pool target reached (${this.containerPool.length}/${MIN_POOL_SIZE}), stopping creation`);
-            break;
+      try {
+        const currentPoolSize = this.containerPool.length;
+
+        if (currentPoolSize < MIN_POOL_SIZE) {
+          const needed = MIN_POOL_SIZE - currentPoolSize;
+          console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
+
+          // PARALLEL CREATION: Create all needed containers at once (faster)
+          const creationPromises: Promise<string>[] = [];
+
+          for (let i = 0; i < needed; i++) {
+            creationPromises.push(
+              this.createContainer()
+                .then(containerId => {
+                  console.log(`✅ Pool replenished: ${containerId.substring(0, 16)}... (${this.containerPool.length}/${MIN_POOL_SIZE})`);
+                  return containerId;
+                })
+                .catch((error: any) => {
+                  console.error(`❌ Failed to create maintenance container:`, error.message);
+                  throw error;
+                })
+            );
           }
 
-          try {
-            const containerId = await this.createContainer();
-            // Don't push here - createContainer() already added it to pool (line 162)
-            console.log(`✅ Pool replenished: ${containerId.substring(0, 16)}... (${this.containerPool.length}/${MIN_POOL_SIZE})`);
-          } catch (error: any) {
-            console.error(`❌ Failed to create maintenance container:`, error.message);
-          }
+          // Wait for all containers to be created
+          const results = await Promise.allSettled(creationPromises);
+
+          const succeeded = results.filter(r => r.status === 'fulfilled').length;
+          const failed = results.filter(r => r.status === 'rejected').length;
+
+          console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${failed} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE}`);
         }
+      } catch (error: any) {
+        console.error('❌ Pool maintenance error:', error.message);
+      } finally {
+        // UNLOCK: Allow next maintenance cycle
+        this.isMaintenanceRunning = false;
       }
     }, CHECK_INTERVAL_MS);
 
