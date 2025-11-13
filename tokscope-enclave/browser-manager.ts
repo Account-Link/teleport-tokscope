@@ -318,6 +318,12 @@ class BrowserManager {
         console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
 
         for (let i = 0; i < needed; i++) {
+          // Check pool size BEFORE each creation (prevents race condition)
+          if (this.containerPool.length >= MIN_POOL_SIZE) {
+            console.log(`✅ Pool target reached (${this.containerPool.length}/${MIN_POOL_SIZE}), stopping creation`);
+            break;
+          }
+
           try {
             const containerId = await this.createContainer();
             // Don't push here - createContainer() already added it to pool (line 162)
