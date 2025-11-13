@@ -2,6 +2,9 @@ import { execSync } from 'child_process';
 import { chromium, Browser } from 'playwright';
 import * as fs from 'fs';
 
+// Configuration
+const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
+
 interface Config {
   tcb: {
     container_idle_timeout_ms: number;
@@ -36,8 +39,11 @@ class BrowserManager {
 
     console.log('🎭 Browser Manager initialized');
     console.log(`📊 Config: ${Math.round((this.config.tcb?.container_idle_timeout_ms || 600000) / 60000)} min idle timeout`);
+    console.log(`📊 Config: ${MIN_POOL_SIZE} container pool size`);
 
     this.startCleanupInterval();
+    this.startPoolMaintenance();
+    this.cleanupExitedContainers(); // Clean up existing orphaned containers
   }
 
   private generateContainerId(): string {
@@ -76,12 +82,12 @@ class BrowserManager {
         '--restart', 'no'
       ];
 
-      // WireGuard VPN proxy configuration (randomly select bucket for load balancing)
-      if (process.env.CHROMIUM_PROXY_ARG) {
-        // Random bucket selection (0-3) for QR auth containers
+      // VPN proxy configuration (random bucket for QR auth load balancing)
+      if (process.env.ENABLE_VPN_ROUTING === 'true') {
+        // Random bucket selection (0-3) for load balancing across Chisel tunnels
         const bucket = Math.floor(Math.random() * 4);
-        const proxyArg = `--proxy-server=socks5://wg-bucket-${bucket}:1080`;
-        console.log(`🌐 Container ${containerId} assigned to wg-bucket-${bucket}`);
+        const proxyArg = `--proxy-server=socks5://chisel-client-${bucket}:1080`;
+        console.log(`🌐 Container ${containerId} assigned to chisel-client-${bucket}`);
         dockerCmd.push('--env', `CHROMIUM_PROXY_ARG=${proxyArg}`);
       }
 
@@ -289,6 +295,62 @@ class BrowserManager {
     }, 60000); // Check every minute
   }
 
+  private startPoolMaintenance(): void {
+    const CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
+
+    setInterval(async () => {
+      const currentPoolSize = this.containerPool.length;
+
+      if (currentPoolSize < MIN_POOL_SIZE) {
+        const needed = MIN_POOL_SIZE - currentPoolSize;
+        console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
+
+        for (let i = 0; i < needed; i++) {
+          try {
+            const containerId = await this.createContainer();
+            this.containerPool.push(containerId);
+            console.log(`✅ Pool replenished: ${containerId.substring(0, 16)}... (${this.containerPool.length}/${MIN_POOL_SIZE})`);
+          } catch (error: any) {
+            console.error(`❌ Failed to create maintenance container:`, error.message);
+          }
+        }
+      }
+    }, CHECK_INTERVAL_MS);
+
+    console.log(`🔧 Pool maintenance started (min size: ${MIN_POOL_SIZE}, check every ${CHECK_INTERVAL_MS / 1000}s)`);
+  }
+
+  private cleanupExitedContainers(): void {
+    try {
+      console.log('🧹 Cleaning up exited tcb-browser containers...');
+
+      // Find all exited tcb-browser containers
+      const exitedContainers = execSync(
+        'docker ps -a --filter "name=tcb-browser" --filter "status=exited" -q',
+        { encoding: 'utf8' }
+      ).trim().split('\n').filter(id => id.length > 0);
+
+      if (exitedContainers.length === 0) {
+        console.log('✅ No exited containers found');
+        return;
+      }
+
+      console.log(`🗑️  Found ${exitedContainers.length} exited containers, removing...`);
+
+      for (const containerId of exitedContainers) {
+        try {
+          execSync(`docker rm ${containerId}`, { stdio: 'ignore' });
+        } catch (error: any) {
+          console.error(`⚠️  Failed to remove ${containerId}:`, error.message);
+        }
+      }
+
+      console.log(`✅ Cleanup complete`);
+    } catch (error: any) {
+      console.error('Cleanup of exited containers failed:', error.message);
+    }
+  }
+
   getStats(): { total: number; available: number; assigned: number; sessions: number } {
     let available = 0;
     let assigned = 0;
@@ -345,7 +407,43 @@ async function main() {
     }
   });
 
-  // Destroy a container
+  // POST version of release (for compatibility)
+  app.post('/release/:sessionId', async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      await browserManager.releaseContainer(sessionId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Failed to release container:', error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  // Destroy container by sessionId (for auth containers)
+  app.post('/destroy/:sessionId', async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+
+      if (!browserManager.isInitialized) {
+        return res.status(500).json({ error: 'Browser Manager not initialized' });
+      }
+
+      const containerId = browserManager.sessionToContainer.get(sessionId);
+
+      if (containerId) {
+        await browserManager.destroyContainer(containerId);
+        console.log(`🗑️  Destroyed container for session ${sessionId.substring(0, 8)}...`);
+        res.json({ success: true, containerId: containerId.substring(0, 16) });
+      } else {
+        res.status(404).json({ error: 'Session not found' });
+      }
+    } catch (error) {
+      console.error('Destroy endpoint error:', error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  // Destroy a container by containerId (legacy)
   app.delete('/destroy/:containerId', async (req, res) => {
     try {
       const { containerId } = req.params;
@@ -354,6 +452,53 @@ async function main() {
     } catch (error) {
       console.error('Failed to destroy container:', error);
       res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  // Pre-warm container pool
+  app.post('/warmup', async (req, res) => {
+    try {
+      const { poolSize } = req.body;
+      const targetSize = poolSize || MIN_POOL_SIZE;
+
+      console.log(`🔥 Warmup request received: create ${targetSize} containers`);
+
+      if (!browserManager.isInitialized) {
+        return res.status(500).json({ error: 'Browser Manager not initialized' });
+      }
+
+      const results = {
+        requested: targetSize,
+        created: 0,
+        failed: 0,
+        errors: [] as string[]
+      };
+
+      // Create containers sequentially (safer than parallel)
+      for (let i = 0; i < targetSize; i++) {
+        try {
+          const containerId = await browserManager.createContainer();
+          browserManager.containerPool.push(containerId);
+          results.created++;
+          console.log(`✅ Warmed container ${i + 1}/${targetSize}: ${containerId.substring(0, 16)}...`);
+        } catch (error: any) {
+          results.failed++;
+          results.errors.push(error.message);
+          console.error(`❌ Failed to create warmup container ${i + 1}:`, error.message);
+        }
+      }
+
+      console.log(`🔥 Warmup complete: ${results.created}/${results.requested} containers created`);
+
+      res.json({
+        success: results.created > 0,
+        poolSize: browserManager.containerPool.length,
+        results
+      });
+
+    } catch (error: any) {
+      console.error('Warmup endpoint error:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 

@@ -144,6 +144,20 @@ async function releaseBrowserInstance(sessionId: string): Promise<void> {
   });
 }
 
+async function destroyBrowserInstance(sessionId: string): Promise<void> {
+  try {
+    const response = await fetch(`${BROWSER_MANAGER_URL}/destroy/${sessionId}`, {
+      method: 'POST'
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to destroy container: ${response.statusText}`);
+    }
+    console.log(`🗑️  Destroyed auth container for session ${sessionId.substring(0, 8)}...`);
+  } catch (error: any) {
+    console.error(`⚠️  Failed to destroy container for ${sessionId}:`, error.message);
+  }
+}
+
 class SessionManager {
   private sessions = new Map<string, SessionData>();
   private lastAccess = new Map<string, number>();
@@ -474,11 +488,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           }
         }
 
-        // Release browser container
+        // Destroy auth container (auth containers should never be reused)
         try {
-          await releaseBrowserInstance(authSessionId);
-        } catch (releaseError) {
-          console.error(`⚠️ Failed to release browser for ${authSessionId}`);
+          await destroyBrowserInstance(authSessionId);
+        } catch (destroyError) {
+          console.error(`⚠️ Failed to destroy auth container for ${authSessionId}`);
         }
 
         return;
@@ -495,11 +509,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
   console.log(`⏰ Login timeout for auth ${authSessionId.substring(0, 8)}...`);
   authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
 
-  // Release browser container
+  // Destroy timed-out auth container
   try {
-    await releaseBrowserInstance(authSessionId);
-  } catch (releaseError) {
-    console.error(`⚠️ Failed to release browser for ${authSessionId}`);
+    await destroyBrowserInstance(authSessionId);
+  } catch (destroyError) {
+    console.error(`⚠️ Failed to destroy timed-out auth container for ${authSessionId}`);
   }
 }
 
@@ -1103,12 +1117,18 @@ app.post('/api/tiktok/execute', async (req, res) => {
     // 7. Execute HTTP request to TikTok (FROM TEE)
     const baseUrl = isWebApi ? 'https://www.tiktok.com' : 'https://api16-normal-c-useast1a.tiktokv.com';
 
-    // WireGuard VPN routing: Use user's assigned bucket (0-3)
-    const bucket = wireguard_bucket !== null && wireguard_bucket !== undefined ? wireguard_bucket : 0;
-    const socksProxy = `socks5://wg-bucket-${bucket}:1080`;
-    const proxyAgent = new SocksProxyAgent(socksProxy);
+    // WireGuard VPN routing: Use user's assigned bucket (0-3) if enabled
+    const disableWireguardRouting = process.env.DISABLE_WIREGUARD_ROUTING === 'true';
+    let proxyAgent = null;
 
-    console.log(`🌐 Routing request through ${socksProxy} for user ${sec_user_id.substring(0, 16)}...`);
+    if (!disableWireguardRouting && wireguard_bucket !== null && wireguard_bucket !== undefined) {
+      const bucket = wireguard_bucket;
+      const socksProxy = `socks5://wg-bucket-${bucket}:1080`;
+      proxyAgent = new SocksProxyAgent(socksProxy);
+      console.log(`🌐 Routing request through ${socksProxy} for user ${sec_user_id.substring(0, 16)}...`);
+    } else {
+      console.log(`🌐 Using direct connection (WireGuard routing disabled)`);
+    }
 
     // For web API, endpoint already has query string; for mobile API, use params
     const axiosConfig: any = {
@@ -1116,10 +1136,14 @@ app.post('/api/tiktok/execute', async (req, res) => {
       url: `${baseUrl}${request.endpoint}`,
       data: request.body,
       headers: requestHeaders,
-      timeout: 15000,
-      httpAgent: proxyAgent,
-      httpsAgent: proxyAgent
+      timeout: 15000
     };
+
+    // Only add proxy agent if VPN routing is enabled
+    if (proxyAgent) {
+      axiosConfig.httpAgent = proxyAgent;
+      axiosConfig.httpsAgent = proxyAgent;
+    }
 
     // Only add params if not already in URL (mobile API uses params object)
     if (!isWebApi && request.params && Object.keys(request.params).length > 0) {
