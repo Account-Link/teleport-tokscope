@@ -73,14 +73,20 @@ class BrowserManager {
         '--env', `CONTAINER_NAME=${containerId}`,
         '--env', `NEKO_DESKTOP_SCREEN=${process.env.NEKO_DESKTOP_SCREEN || '1920x1080@30'}`,
         '--env', `NEKO_DESKTOP_SCALING=${process.env.NEKO_DESKTOP_SCALING || '1.0'}`,
-        '--restart', 'no',
-        process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest'
+        '--restart', 'no'
       ];
 
-      // Optional proxy configuration
+      // WireGuard VPN proxy configuration (randomly select bucket for load balancing)
       if (process.env.CHROMIUM_PROXY_ARG) {
-        dockerCmd.splice(dockerCmd.length - 2, 0, '--env', `CHROMIUM_PROXY_ARG=${process.env.CHROMIUM_PROXY_ARG}`);
+        // Random bucket selection (0-3) for QR auth containers
+        const bucket = Math.floor(Math.random() * 4);
+        const proxyArg = `--proxy-server=socks5://wg-bucket-${bucket}:1080`;
+        console.log(`🌐 Container ${containerId} assigned to wg-bucket-${bucket}`);
+        dockerCmd.push('--env', `CHROMIUM_PROXY_ARG=${proxyArg}`);
       }
+
+      // Add image name as final argument
+      dockerCmd.push(process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest');
 
       const result = execSync(dockerCmd.join(' '), { encoding: 'utf8' });
       const shortContainerId = result.trim().substring(0, 12);

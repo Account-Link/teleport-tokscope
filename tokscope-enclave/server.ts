@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import jsQR from 'jsqr';
 import { Jimp } from 'jimp';
 import axios from 'axios';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 
 const BrowserAutomationClient = require('./lib/browser-automation-client');
 const WebApiClient = require('./lib/web-api-client');
@@ -910,7 +911,7 @@ app.get('/containers', async (req, res) => {
  */
 app.post('/api/tiktok/execute', async (req, res) => {
   try {
-    const { sec_user_id, request } = req.body;
+    const { sec_user_id, wireguard_bucket, request } = req.body;
 
     // 1. Verify Xordi API key
     const apiKey = req.header('X-Api-Key');
@@ -926,10 +927,11 @@ app.post('/api/tiktok/execute', async (req, res) => {
         '/aweme/v1/feed/',              // Mobile API: For You feed
         '/aweme/v1/user/',              // Mobile API: User profile
         '/aweme/v1/search/item/',       // Mobile API: Search
-        '/api/recommend/item_list/'     // Web API: For You feed (working implementation)
+        '/api/recommend/item_list/',    // Web API: For You feed (working implementation)
+        '/tiktok/watch/history/list/v1/' // Web API: Watch history (working implementation)
       ],
       authenticated: [
-        '/aweme/v1/watch/history/'      // Mobile API: Watch history
+        '/aweme/v1/watch/history/'      // Mobile API: Watch history (experimental)
       ],
       write_operations: [
         '/aweme/v1/commit/item/digg/',  // Mobile API: Like video
@@ -1101,13 +1103,22 @@ app.post('/api/tiktok/execute', async (req, res) => {
     // 7. Execute HTTP request to TikTok (FROM TEE)
     const baseUrl = isWebApi ? 'https://www.tiktok.com' : 'https://api16-normal-c-useast1a.tiktokv.com';
 
+    // WireGuard VPN routing: Use user's assigned bucket (0-3)
+    const bucket = wireguard_bucket !== null && wireguard_bucket !== undefined ? wireguard_bucket : 0;
+    const socksProxy = `socks5://wg-bucket-${bucket}:1080`;
+    const proxyAgent = new SocksProxyAgent(socksProxy);
+
+    console.log(`🌐 Routing request through ${socksProxy} for user ${sec_user_id.substring(0, 16)}...`);
+
     // For web API, endpoint already has query string; for mobile API, use params
     const axiosConfig: any = {
       method: request.method,
       url: `${baseUrl}${request.endpoint}`,
       data: request.body,
       headers: requestHeaders,
-      timeout: 15000
+      timeout: 15000,
+      httpAgent: proxyAgent,
+      httpsAgent: proxyAgent
     };
 
     // Only add params if not already in URL (mobile API uses params object)
