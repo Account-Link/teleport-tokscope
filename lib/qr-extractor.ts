@@ -6,14 +6,20 @@ class QRExtractor {
     try {
       console.log('Current page URL:', page.url());
 
-      // Wait for the page to be fully loaded
+      // DISABLED: Network idle check - extraction retries handle slow page loads (saves 0-10s)
+      // Re-enable if you see extraction failing on slow connections
+      /*
       try {
         await page.waitForLoadState('networkidle', { timeout: 10000 });
         console.log('Page network idle, waiting for QR to load...');
       } catch (err) {
         console.log('Network idle timeout, proceeding anyway...');
       }
+      */
 
+      // DISABLED: Placeholder check - validation rejects wrong QRs now (saves 10s guaranteed)
+      // Re-enable if you see promotional/download QR codes being returned to users
+      /*
       // Wait for IMG src to change from placeholder to actual QR
       // Placeholder: c4c40812758dc8175106.png
       // Real QR: will be different (data URL or different CDN URL)
@@ -36,6 +42,7 @@ class QRExtractor {
       } catch (err) {
         console.log('⚠️ Timeout waiting for real QR, attempting extraction anyway...');
       }
+      */
 
       // Helper function to attempt QR extraction from DOM
       const attemptExtraction = async () => {
@@ -164,10 +171,14 @@ class QRExtractor {
       let validationAttempts = 0;
       const maxValidationAttempts = 3;
 
-      // If first attempt failed, wait and retry once
-      if (!qrData) {
-        console.log('⚠️ First extraction attempt failed, waiting 2 seconds and retrying...');
-        await page.waitForTimeout(2000);
+      // If first attempt failed, retry up to 30 times with 0.2s intervals (max 6s total)
+      let extractionAttempts = 0;
+      const maxExtractionAttempts = 30;
+
+      while (!qrData && extractionAttempts < maxExtractionAttempts) {
+        extractionAttempts++;
+        console.log(`⚠️ Extraction attempt ${extractionAttempts}/${maxExtractionAttempts} failed, retrying in 0.2s...`);
+        await page.waitForTimeout(200);
         qrData = await attemptExtraction();
       }
 
@@ -200,8 +211,8 @@ class QRExtractor {
         console.log(`⚠️ Validation failed: ${validationResult.reason}`);
 
         if (validationAttempts < maxValidationAttempts) {
-          console.log(`Waiting 3 seconds for real QR to load, then retrying...`);
-          await page.waitForTimeout(3000);
+          console.log(`Waiting 0.2s for real QR to load, then retrying...`);
+          await page.waitForTimeout(200);
           qrData = await attemptExtraction();
           if (!qrData) {
             console.log('❌ Re-extraction failed');
