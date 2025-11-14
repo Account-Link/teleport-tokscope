@@ -15,9 +15,15 @@ COPY tokscope-enclave/policies.json /etc/chromium/policies/managed/policies.json
 COPY tokscope-enclave/openbox.xml /etc/neko/openbox.xml
 COPY tokscope-enclave/simple-socks5-relay.js /usr/local/bin/simple-socks5-relay.js
 COPY tokscope-enclave/start-3proxy.sh /usr/local/bin/start-3proxy.sh
+COPY tokscope-enclave/supervisord-minimal.conf /etc/neko/supervisord-minimal.conf
 
 # Make scripts executable
 RUN chmod +x /usr/local/bin/start-3proxy.sh
 
-# Start supervisord with neko default (which includes our chromium.conf with debug proxy)
-CMD ["/usr/bin/supervisord", "-c", "/etc/neko/supervisord.conf"]
+# Override Neko's health check - check CDP port 9223 instead of Neko port 8080
+# We disabled Neko streaming, so we check if Chrome DevTools Protocol is accessible
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:9223/json/version || exit 1
+
+# Start supervisord with MINIMAL config (no Neko streaming, no audio - we use CDP only)
+CMD ["/usr/bin/supervisord", "-c", "/etc/neko/supervisord-minimal.conf"]
