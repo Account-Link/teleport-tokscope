@@ -20,11 +20,6 @@ COPY tokscope-enclave/supervisord-minimal.conf /etc/neko/supervisord-minimal.con
 # Make scripts executable
 RUN chmod +x /usr/local/bin/start-3proxy.sh
 
-# Override Neko's health check - check CDP port 9223 instead of Neko port 8080
-# We disabled Neko streaming, so we check if Chrome DevTools Protocol is accessible
-# Using Neko's original timing (0s start-period, 8 retries) for fast startup detection
-HEALTHCHECK --interval=10s --timeout=5s --start-period=0s --retries=8 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:9223/json/version || exit 1
-
-# Start supervisord with MINIMAL config (no Neko streaming, no audio - we use CDP only)
-CMD ["/usr/bin/supervisord", "-c", "/etc/neko/supervisord-minimal.conf"]
+# Use Neko's default supervisord config (with streaming/audio) for reliable health checks
+# Streaming runs at 1 FPS (set via NEKO_DESKTOP_SCREEN env var) to minimize overhead
+CMD ["/usr/bin/supervisord", "-c", "/etc/neko/supervisord.conf"]
