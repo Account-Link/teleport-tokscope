@@ -1,8 +1,56 @@
 import { Page } from 'playwright';
 import jsQR from 'jsqr';
+import { QRPerformanceTracker } from './metrics/QRPerformanceTracker';
+import { QRMetricsCollector } from './metrics/QRMetricsCollector';
+
+interface RetryStrategy {
+  name: string;
+  initialWait: number;
+  selectorTimeout: number;
+  maxRetries: number;
+}
 
 class QRExtractor {
-  static async extractQRCodeFromPage(page: Page): Promise<{ image: string, decodedUrl: string | null, error?: string }> {
+  // Escalating retry strategy: fast attempts first, fallback to safe
+  private static readonly RETRY_STRATEGY: RetryStrategy[] = [
+    // Strategy 1: Fast (standard timing) - 1 attempt
+    {
+      name: 'fast-parallel-v1',
+      initialWait: 500,
+      selectorTimeout: 800,
+      maxRetries: 1
+    },
+    // Strategy 2: Fast+ (handles variance) - 2 attempts
+    {
+      name: 'fast-parallel-v2',
+      initialWait: 700,
+      selectorTimeout: 1000,
+      maxRetries: 2
+    },
+    // Strategy 3: Moderate (escalation) - 1 attempt
+    {
+      name: 'moderate-parallel',
+      initialWait: 1000,
+      selectorTimeout: 1500,
+      maxRetries: 1
+    },
+    // Strategy 4: Safe (original defensive logic) - 3 attempts
+    {
+      name: 'safe-sequential',
+      initialWait: 2000,
+      selectorTimeout: 3000,
+      maxRetries: 3
+    }
+  ];
+
+  static async extractQRCodeFromPage(page: Page, sessionId: string | null = null): Promise<{ image: string, decodedUrl: string | null, error?: string }> {
+    // Create performance tracker for this session
+    const performanceTracker = new QRPerformanceTracker(sessionId);
+    performanceTracker.mark('total_start');
+    performanceTracker.mark('qrExtraction_start');
+
+    const startTime = Date.now();
+
     try {
       console.log('Current page URL:', page.url());
 
@@ -166,34 +214,79 @@ class QRExtractor {
         });
       };
 
-      // First attempt at extraction
-      let qrData = await attemptExtraction();
-      let validationAttempts = 0;
-      const maxValidationAttempts = 3;
+      // Escalating retry strategy: try each strategy in order
+      let qrData: any = null;
+      let totalAttempts = 0;
+      let successfulStrategy: string | null = null;
 
-      // If first attempt failed, retry up to 30 times with 0.2s intervals (max 6s total)
-      let extractionAttempts = 0;
-      const maxExtractionAttempts = 30;
+      for (let strategyIndex = 0; strategyIndex < this.RETRY_STRATEGY.length; strategyIndex++) {
+        const strategy = this.RETRY_STRATEGY[strategyIndex];
 
-      while (!qrData && extractionAttempts < maxExtractionAttempts) {
-        extractionAttempts++;
-        console.log(`⚠️ Extraction attempt ${extractionAttempts}/${maxExtractionAttempts} failed, retrying in 0.2s...`);
-        await page.waitForTimeout(200);
-        qrData = await attemptExtraction();
+        for (let retry = 0; retry < strategy.maxRetries; retry++) {
+          totalAttempts++;
+          const attemptStart = Date.now();
+
+          try {
+            console.log(`[QR Extract] Attempt ${totalAttempts}: ${strategy.name} (retry ${retry + 1}/${strategy.maxRetries})`);
+
+            // Initial wait for page stability
+            await page.waitForTimeout(strategy.initialWait);
+
+            // Attempt extraction
+            qrData = await attemptExtraction();
+
+            if (qrData) {
+              // SUCCESS - mark timing and log
+              performanceTracker.mark('qrExtraction_end');
+              performanceTracker.setStrategy(
+                strategy.name,
+                retry + 1,
+                totalAttempts
+              );
+              performanceTracker.markSuccess();
+
+              const duration = Date.now() - attemptStart;
+              const totalDuration = Date.now() - startTime;
+              successfulStrategy = strategy.name;
+
+              console.log(`[QR Extract] ✅ Success via ${strategy.name} in ${duration}ms (total: ${totalDuration}ms)`);
+              break; // Exit retry loop
+            }
+
+          } catch (error: any) {
+            const duration = Date.now() - attemptStart;
+            console.warn(`[QR Extract] ❌ Failed: ${strategy.name} (retry ${retry + 1}) - ${error?.message || 'unknown error'}`);
+          }
+        }
+
+        if (qrData) break; // Exit strategy loop if we have data
       }
 
-      // If retry also failed, take screenshot as final fallback
+      // If all strategies failed, take screenshot as final fallback
       if (!qrData) {
-        console.log('❌ Retry also failed, taking screenshot as final fallback');
+        performanceTracker.mark('qrExtraction_end');
+        performanceTracker.markFailure(new Error('All extraction strategies exhausted'));
+
+        console.log('❌ All retry strategies exhausted, taking screenshot as final fallback');
         const screenshotBuffer = await page.screenshot();
         const screenshot = screenshotBuffer.toString('base64');
+
+        // Log metrics even on failure
+        performanceTracker.mark('total_end');
+        const report = performanceTracker.logReport();
+        QRMetricsCollector.logSession(report);
+
         return {
           image: `data:image/png;base64,${screenshot}`,
-          decodedUrl: null
+          decodedUrl: null,
+          error: 'QR extraction failed after all retry strategies'
         };
       }
 
       // Validate QR in a loop with retries
+      let validationAttempts = 0;
+      const maxValidationAttempts = 3;
+
       while (validationAttempts < maxValidationAttempts) {
         validationAttempts++;
         console.log(`Validation attempt ${validationAttempts}/${maxValidationAttempts}`);
@@ -202,6 +295,13 @@ class QRExtractor {
 
         if (validationResult.valid) {
           console.log('✅ QR validation passed!');
+
+          // Mark total end and log report
+          performanceTracker.mark('cookieDetection_start'); // Placeholder for now
+          performanceTracker.mark('total_end');
+          const report = performanceTracker.logReport();
+          QRMetricsCollector.logSession(report);
+
           return {
             image: qrData.dataUrl,
             decodedUrl: validationResult.decodedUrl
@@ -223,6 +323,12 @@ class QRExtractor {
 
       // All validation attempts failed
       console.log('❌ All validation attempts exhausted, taking screenshot fallback');
+      performanceTracker.mark('qrExtraction_end');
+      performanceTracker.markFailure(new Error('QR validation failed'));
+      performanceTracker.mark('total_end');
+      const report = performanceTracker.logReport();
+      QRMetricsCollector.logSession(report);
+
       const screenshotBuffer = await page.screenshot();
       const screenshot = screenshotBuffer.toString('base64');
       return {
@@ -290,8 +396,16 @@ class QRExtractor {
         }
       }
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('QR extraction failed:', error);
+
+      // Log metrics even on catastrophic failure
+      performanceTracker.mark('qrExtraction_end');
+      performanceTracker.mark('total_end');
+      performanceTracker.markFailure(error);
+      const report = performanceTracker.logReport();
+      QRMetricsCollector.logSession(report);
+
       throw error;
     }
   }

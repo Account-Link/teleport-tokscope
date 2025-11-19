@@ -410,8 +410,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           timeout: 30000
         });
 
-        // Extract and decode QR code
-        const qrData = await QRExtractor.extractQRCodeFromPage(authPage);
+        // Extract and decode QR code (with sessionId for metrics tracking)
+        const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
         authSessionManager.updateAuthSession(authSessionId, {
           qrCodeData: qrData.image,
           qrDecodedUrl: qrData.decodedUrl  // Store the magic link URL
