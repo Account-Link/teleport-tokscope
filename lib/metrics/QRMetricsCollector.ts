@@ -274,7 +274,7 @@ export class QRMetricsCollector {
     }
 
     // Recommendation 3: QR Extraction bottleneck
-    const avgQrExtraction = parseInt(this.avg(sessions, 'phases.qrExtraction'));
+    const avgQrExtraction = this.avg(sessions, 'phases.qrExtraction');
     if (avgQrExtraction > 5000) {
       recs.push({
         severity: 'info',
