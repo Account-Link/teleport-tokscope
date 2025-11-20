@@ -130,6 +130,16 @@ class QRExtractor {
         const images = document.querySelectorAll('img');
         console.log(`Found ${images.length} img elements`);
 
+        // OPTIMIZATION: Skip IMG if no Canvas found yet
+        // Canvas contains the real login QR (fast, no CORS needed)
+        // IMG is usually promotional QR (slow CORS load, 57+ seconds)
+        // Strategy: Wait for Canvas to render instead of processing IMG
+        if (images.length > 0 && canvases.length === 0) {
+          console.log('⏭️  Skipping IMG elements - waiting for Canvas to render (optimization)');
+          console.log(`   Found ${images.length} IMG but 0 Canvas - will retry`);
+          return null; // Trigger retry loop to wait for Canvas
+        }
+
         // Check all square images (potential QR codes) and DECODE them
         for (const img of images) {
           // Only check images that could be QR codes (square, reasonable size)
