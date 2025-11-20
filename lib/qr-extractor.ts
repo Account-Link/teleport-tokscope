@@ -97,7 +97,7 @@ class QRExtractor {
         console.log('==================');
 
         // Now do actual extraction
-        return await page.evaluate(() => {
+        return await page.evaluate(async () => {
         // Method 1: Canvas element (get both dataUrl and imageData)
         const canvases = document.querySelectorAll('canvas');
         console.log(`Found ${canvases.length} canvas elements`);
