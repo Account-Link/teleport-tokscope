@@ -137,22 +137,35 @@ class QRExtractor {
           if (img.naturalWidth !== img.naturalHeight) continue; // QR codes are square
 
           try {
-            // Draw image to canvas to get imageData for decoding
+            // FIX: Load image with CORS to avoid canvas tainting
+            // This allows us to access pixel data via getImageData()
+            const imgElement = new Image();
+            imgElement.crossOrigin = 'anonymous';
+            imgElement.src = img.src;
+
+            // Wait for CORS-enabled image to load (max 2s timeout)
+            await new Promise<void>((resolve, reject) => {
+              imgElement.onload = () => resolve();
+              imgElement.onerror = () => reject(new Error('CORS image load failed'));
+              setTimeout(() => reject(new Error('CORS image load timeout')), 2000);
+            });
+
+            // Draw CORS-enabled image to canvas to get imageData for decoding
             const canvas = document.createElement('canvas');
             const ctx = canvas.getContext('2d');
             if (!ctx) continue;
 
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-            ctx.drawImage(img, 0, 0);
+            canvas.width = imgElement.naturalWidth;
+            canvas.height = imgElement.naturalHeight;
+            ctx.drawImage(imgElement, 0, 0);
 
-            // Get imageData for QR decoding
+            // Get imageData for QR decoding (now works without CORS error!)
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
             // Try to get dataUrl too
             const dataUrl = canvas.toDataURL('image/png');
 
-            console.log(`Checking square image: ${img.src.substring(0, 100)} (${img.naturalWidth}x${img.naturalHeight})`);
+            console.log(`✅ Extracted imageData with CORS from: ${img.src.substring(0, 100)} (${imgElement.naturalWidth}x${imgElement.naturalHeight})`);
 
             return {
               dataUrl: dataUrl || img.src,
@@ -163,8 +176,8 @@ class QRExtractor {
               }
             };
           } catch (e) {
-            console.log('Failed to extract imageData from img:', e);
-            // If canvas extraction fails, return the src as fallback
+            console.log('Failed to extract imageData from img with CORS:', e);
+            // If CORS extraction fails, return the src as fallback
             if (img.src) {
               return { dataUrl: img.src, imageData: null };
             }
