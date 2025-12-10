@@ -1,9 +1,10 @@
 import { execSync } from 'child_process';
-import { chromium, Browser } from 'playwright';
+import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
+const ENABLE_PERSISTENT_RECYCLING = process.env.ENABLE_PERSISTENT_RECYCLING !== 'false'; // v19 feature flag
 
 interface Config {
   tcb: {
@@ -17,9 +18,12 @@ interface ContainerInfo {
   ip: string;
   cdpUrl: string;
   browser: Browser | null;
+  context: BrowserContext | null;  // v19: Persistent context for recycling
+  page: Page | null;               // v19: Persistent page for pre-warming
+  sessionCount: number;            // v19: Track usage for lifecycle management
   createdAt: number;
   lastUsed: number;
-  status: 'pooled' | 'assigned' | 'released';
+  status: 'warming' | 'pooled' | 'assigned' | 'released' | 'recycling';  // v19: Added warming, recycling
   sessionId: string | null;
 }
 
@@ -44,7 +48,7 @@ class BrowserManager {
 
     this.startCleanupInterval();
     this.startPoolMaintenance();
-    this.cleanupExitedContainers(); // Clean up existing orphaned containers
+    this.cleanupAllOrphanedContainers(); // Clean up ALL containers from previous instance (running + exited)
   }
 
   private generateContainerId(): string {
@@ -84,9 +88,8 @@ class BrowserManager {
       ];
 
       // Resource limits (configurable via env vars)
-      if (process.env.BROWSER_CPU_LIMIT) {
-        dockerCmd.push('--cpus', process.env.BROWSER_CPU_LIMIT);
-      }
+      // NOTE: CPU limits disabled - Phala Docker-in-Docker doesn't support CPU tuning
+      // Tested: --cpus flag (fails), --cpuset-cpus pinning (no performance gain)
       if (process.env.BROWSER_MEMORY_LIMIT) {
         dockerCmd.push('--memory', process.env.BROWSER_MEMORY_LIMIT);
       }
@@ -158,15 +161,54 @@ class BrowserManager {
         }
       }
 
+      // v19: Pre-warm container with QR page (if recycling enabled)
+      let context: BrowserContext | null = null;
+      let page: Page | null = null;
+      let finalStatus: ContainerInfo['status'] = 'pooled';
+
+      if (true) {  // Always pre-warm containers for fast QR extraction (recycling controlled by ENABLE_PERSISTENT_RECYCLING flag)
+        try {
+          console.log(`🔥 Pre-warming container ${containerId.substring(0, 16)}... with QR page...`);
+          finalStatus = 'warming';
+
+          // Create persistent context (starts clean, no cookies by default)
+          context = await browser!.newContext();
+          page = await context.newPage();
+
+          // Navigate to QR page (one-time cost ~6s)
+          await page.goto('https://www.tiktok.com/login/qrcode', {
+            waitUntil: 'networkidle',
+            timeout: 30000
+          });
+
+          // Verify QR container loaded
+          await page.waitForSelector('img[alt="qrcode"]', {
+            timeout: 10000,
+            state: 'visible'
+          });
+
+          finalStatus = 'pooled';
+          console.log(`✅ Container ${containerId.substring(0, 16)}... pre-warmed (QR page loaded)`);
+        } catch (warmError: any) {
+          console.error(`⚠️ Pre-warming failed for ${containerId}: ${warmError.message}`);
+          console.log(`📦 Container will be available without pre-warming`);
+          finalStatus = 'pooled';
+          // Continue without pre-warming
+        }
+      }
+
       const containerInfo: ContainerInfo = {
         containerId,
         shortId: shortContainerId,
         ip: containerIP,
         cdpUrl,
         browser,
+        context,              // v19: Store persistent context
+        page,                 // v19: Store persistent page
+        sessionCount: 0,      // v19: Initialize session counter
         createdAt: Date.now(),
         lastUsed: Date.now(),
-        status: 'pooled',
+        status: finalStatus,
         sessionId: null
       };
 
@@ -224,7 +266,23 @@ class BrowserManager {
 
     this.sessionToContainer.set(sessionId, containerId);
 
-    console.log(`📦 Assigned container ${containerId.substring(0, 16)}... to session ${sessionId.substring(0, 8)}...`);
+    // v19: Fast reload if page is pre-warmed
+    if (ENABLE_PERSISTENT_RECYCLING && containerInfo.page) {
+      try {
+        console.log(`🔄 Refreshing pre-warmed QR page for ${sessionId.substring(0, 8)}...`);
+        await containerInfo.page.reload({
+          waitUntil: 'domcontentloaded',
+          timeout: 5000
+        });
+        console.log(`✅ Container assigned ${containerId.substring(0, 16)}... to session ${sessionId.substring(0, 8)}... (reused, session #${containerInfo.sessionCount + 1})`);
+      } catch (reloadError: any) {
+        console.error(`⚠️ Page reload failed for ${containerId}: ${reloadError.message}`);
+        console.log(`📦 Container assigned without reload`);
+      }
+    } else {
+      console.log(`📦 Assigned container ${containerId.substring(0, 16)}... to session ${sessionId.substring(0, 8)}...`);
+    }
+
     return containerInfo;
   }
 
@@ -247,6 +305,124 @@ class BrowserManager {
     }
 
     this.sessionToContainer.delete(sessionId);
+  }
+
+  /**
+   * v19: Recycle container - Nuclear cleanup and return to pool
+   * This enables persistent containers that can be reused indefinitely
+   */
+  async recycleContainer(sessionId: string): Promise<void> {
+    if (!ENABLE_PERSISTENT_RECYCLING) {
+      // Fallback to destroy behavior if recycling disabled
+      console.log(`⚠️ Persistent recycling disabled, destroying container instead`);
+      const containerId = this.sessionToContainer.get(sessionId);
+      if (containerId) {
+        await this.destroyContainer(containerId);
+      }
+      return;
+    }
+
+    if (!this.sessionToContainer.has(sessionId)) {
+      console.log(`⚠️ No container assigned to session ${sessionId.substring(0, 8)}...`);
+      return;
+    }
+
+    const containerId = this.sessionToContainer.get(sessionId)!;
+    const containerInfo = this.containers.get(containerId);
+
+    if (!containerInfo) {
+      console.log(`⚠️ Container for session ${sessionId} not found in registry`);
+      return;
+    }
+
+    containerInfo.status = 'recycling';
+    console.log(`♻️ Recycling container ${containerId.substring(0, 16)}... (session #${containerInfo.sessionCount})...`);
+
+    try {
+      if (!containerInfo.context || !containerInfo.page) {
+        throw new Error('Container missing context or page (not pre-warmed)');
+      }
+
+      // 1. Nuclear cleanup: Clear ALL browser state
+      await containerInfo.context.clearCookies();
+
+      // 2. Clear localStorage, sessionStorage, IndexedDB
+      await containerInfo.page.evaluate(() => {
+        localStorage.clear();
+        sessionStorage.clear();
+
+        // Clear IndexedDB
+        if (window.indexedDB && window.indexedDB.databases) {
+          window.indexedDB.databases().then(dbs => {
+            dbs.forEach(db => {
+              if (db.name) window.indexedDB.deleteDatabase(db.name);
+            });
+          });
+        }
+      });
+
+      // 3. Refresh to clean QR page (1-2s, JS cached!)
+      await containerInfo.page.goto('https://www.tiktok.com/login/qrcode', {
+        waitUntil: 'domcontentloaded',
+        timeout: 5000
+      });
+
+      // 4. Verify clean state
+      await containerInfo.page.waitForSelector('img[alt="qrcode"]', {
+        timeout: 10000,
+        state: 'visible'
+      });
+
+      // 5. Back to pool
+      containerInfo.status = 'pooled';
+      containerInfo.sessionId = null;
+      containerInfo.sessionCount++;
+      containerInfo.lastUsed = Date.now();
+
+      // Return to pool
+      this.containerPool.push(containerId);
+      this.sessionToContainer.delete(sessionId);
+
+      console.log(`✅ Container recycled (${containerInfo.sessionCount} total sessions, pool: ${this.containerPool.length}/${MIN_POOL_SIZE})`);
+
+      // 6. Periodic full restart (prevent memory leaks)
+      if (containerInfo.sessionCount >= 100) {
+        console.log(`🔄 Container ${containerId.substring(0, 16)}... hit 100 sessions, scheduling replacement...`);
+        // Don't await - do in background
+        this.replaceContainer(containerId).catch(err =>
+          console.error(`Failed to replace container ${containerId}:`, err.message)
+        );
+      }
+
+    } catch (error: any) {
+      console.error(`❌ Recycling failed for ${containerId.substring(0, 16)}...: ${error.message}`);
+      console.log(`🗑️ Falling back to destroy and replace`);
+
+      // Fallback: Destroy and replace container
+      try {
+        await this.destroyContainer(containerId);
+        // Pool maintenance will create a new one automatically
+      } catch (destroyError: any) {
+        console.error(`Failed to destroy failed container:`, destroyError.message);
+      }
+    }
+  }
+
+  /**
+   * v19: Replace a container with a fresh one (after 100 sessions or on error)
+   */
+  private async replaceContainer(containerId: string): Promise<void> {
+    console.log(`🔄 Replacing container ${containerId.substring(0, 16)}...`);
+
+    try {
+      // Destroy old container
+      await this.destroyContainer(containerId);
+
+      // Pool maintenance will create a new one automatically to maintain MIN_POOL_SIZE
+      console.log(`✅ Container ${containerId.substring(0, 16)}... removed, pool maintenance will replenish`);
+    } catch (error: any) {
+      console.error(`Failed to replace container ${containerId}:`, error.message);
+    }
   }
 
   async destroyContainer(containerId: string): Promise<void> {
@@ -363,34 +539,34 @@ class BrowserManager {
     console.log(`🔧 Pool maintenance started (min size: ${MIN_POOL_SIZE}, check every ${CHECK_INTERVAL_MS / 1000}s)`);
   }
 
-  private cleanupExitedContainers(): void {
+  private cleanupAllOrphanedContainers(): void {
     try {
-      console.log('🧹 Cleaning up exited tcb-browser containers...');
+      console.log('🧹 Cleaning up ALL tcb-browser containers from previous instance...');
 
-      // Find all exited tcb-browser containers
-      const exitedContainers = execSync(
-        'docker ps -a --filter "name=tcb-browser" --filter "status=exited" -q',
+      // Find ALL tcb-browser containers (running or exited) - they're orphans since we just started
+      const allContainers = execSync(
+        'docker ps -a --filter "name=tcb-browser" -q',
         { encoding: 'utf8' }
       ).trim().split('\n').filter(id => id.length > 0);
 
-      if (exitedContainers.length === 0) {
-        console.log('✅ No exited containers found');
+      if (allContainers.length === 0) {
+        console.log('✅ No orphaned containers found');
         return;
       }
 
-      console.log(`🗑️  Found ${exitedContainers.length} exited containers, removing...`);
+      console.log(`🗑️  Found ${allContainers.length} orphaned containers, force removing...`);
 
-      for (const containerId of exitedContainers) {
+      for (const containerId of allContainers) {
         try {
-          execSync(`docker rm ${containerId}`, { stdio: 'ignore' });
+          execSync(`docker rm -f ${containerId}`, { stdio: 'ignore' });
         } catch (error: any) {
           console.error(`⚠️  Failed to remove ${containerId}:`, error.message);
         }
       }
 
-      console.log(`✅ Cleanup complete`);
+      console.log(`✅ Cleanup complete - starting fresh`);
     } catch (error: any) {
-      console.error('Cleanup of exited containers failed:', error.message);
+      console.error('Cleanup of orphaned containers failed:', error.message);
     }
   }
 
@@ -470,7 +646,24 @@ async function main() {
     }
   });
 
-  // Destroy container by sessionId (for auth containers)
+  // v19: Recycle container by sessionId (persistent containers)
+  app.post('/recycle/:sessionId', async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+
+      await browserManager.recycleContainer(sessionId);
+      res.json({
+        success: true,
+        message: 'Container recycled and returned to pool',
+        poolSize: browserManager.getPoolSize()
+      });
+    } catch (error) {
+      console.error('Recycle endpoint error:', error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  // Destroy container by sessionId (for auth containers - legacy/fallback)
   app.post('/destroy/:sessionId', async (req, res) => {
     try {
       const { sessionId } = req.params;

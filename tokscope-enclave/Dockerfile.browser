@@ -15,7 +15,6 @@ COPY tokscope-enclave/policies.json /etc/chromium/policies/managed/policies.json
 COPY tokscope-enclave/openbox.xml /etc/neko/openbox.xml
 COPY tokscope-enclave/simple-socks5-relay.js /usr/local/bin/simple-socks5-relay.js
 COPY tokscope-enclave/start-3proxy.sh /usr/local/bin/start-3proxy.sh
-COPY tokscope-enclave/supervisord-minimal.conf /etc/neko/supervisord-minimal.conf
 
 # Make scripts executable
 RUN chmod +x /usr/local/bin/start-3proxy.sh

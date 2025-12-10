@@ -1,5 +1,10 @@
 # TokScope Image Build Guide
 
+## Registry
+
+**Current:** `ghcr.io/ognodefather`
+**Legacy:** `ghcr.io/neonechozero` (deprecated)
+
 ## Build Commands (Must run from repository root)
 
 All build commands MUST be run from `/home/zero/teleport-tokscope/` (repository root).
@@ -8,47 +13,43 @@ All build commands MUST be run from `/home/zero/teleport-tokscope/` (repository 
 
 ```bash
 cd /home/zero/teleport-tokscope
-docker build -t ghcr.io/neonechozero/tokscope-browser-manager:xordi-vXX \
+docker build -t ghcr.io/ognodefather/tokscope-browser-manager:v054 \
   -f tokscope-enclave/Dockerfile.browser-manager .
-docker push ghcr.io/neonechozero/tokscope-browser-manager:xordi-vXX
+docker push ghcr.io/ognodefather/tokscope-browser-manager:v054
 ```
-
-**Current version:** `xordi-v11`
 
 ### Enclave API Image
 
 ```bash
 cd /home/zero/teleport-tokscope
-docker build -t ghcr.io/neonechozero/tokscope-enclave-api:xordi-vXX \
-  -f tokscope-enclave/Dockerfile.enclave .
-docker push ghcr.io/neonechozero/tokscope-enclave-api:xordi-vXX
+docker build -t ghcr.io/ognodefather/tokscope-enclave-api:v054 \
+  -f tokscope-enclave/Dockerfile.api .
+docker push ghcr.io/ognodefather/tokscope-enclave-api:v054
 ```
-
-**Current version:** `xordi-v17`
 
 ### Browser Image (TCB)
 
 ```bash
 cd /home/zero/teleport-tokscope
-docker build -t ghcr.io/neonechozero/tokscope-browser:xordi-vXX \
-  -f tcb-neko-chrome/Dockerfile tcb-neko-chrome/
-docker push ghcr.io/neonechozero/tokscope-browser:xordi-vXX
+docker build -t ghcr.io/ognodefather/tokscope-browser:v054 \
+  -f tokscope-enclave/Dockerfile.browser .
+docker push ghcr.io/ognodefather/tokscope-browser:v054
 ```
-
-**Current version:** `xordi-v10`
 
 ## Version Tracking
 
-Update `docker-compose-phala.yml` after building new images:
+Version tag matches compose file: `phala-compose-v054.yml` → `:v054`
+
+Update compose file after building new images:
 
 ```yaml
 tokscope-enclave:
-  image: ghcr.io/neonechozero/tokscope-enclave-api:xordi-v17
+  image: ghcr.io/ognodefather/tokscope-enclave-api:v054
 
 browser-manager:
-  image: ghcr.io/neonechozero/tokscope-browser-manager:xordi-v11
+  image: ghcr.io/ognodefather/tokscope-browser-manager:v054
   environment:
-    - TCB_BROWSER_IMAGE=ghcr.io/neonechozero/tokscope-browser:xordi-v10
+    - TCB_BROWSER_IMAGE=ghcr.io/ognodefather/tokscope-browser:v054
 ```
 
 ## Common Mistakes

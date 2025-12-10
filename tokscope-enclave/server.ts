@@ -159,6 +159,24 @@ async function destroyBrowserInstance(sessionId: string): Promise<void> {
   }
 }
 
+/**
+ * v19: Recycle browser instance - clear cookies/storage, refresh to QR page, return to pool
+ * This replaces destroyBrowserInstance() for persistent containers
+ */
+async function recycleBrowserInstance(sessionId: string): Promise<void> {
+  try {
+    const response = await fetch(`${BROWSER_MANAGER_URL}/recycle/${sessionId}`, {
+      method: 'POST'
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to recycle container: ${response.statusText}`);
+    }
+    console.log(`♻️  Recycled auth container for session ${sessionId.substring(0, 8)}...`);
+  } catch (error: any) {
+    console.error(`⚠️  Failed to recycle container for ${sessionId}:`, error.message);
+  }
+}
+
 class SessionManager {
   private sessions = new Map<string, SessionData>();
   private lastAccess = new Map<string, number>();
@@ -492,11 +510,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           }
         }
 
-        // Destroy auth container (auth containers should never be reused)
+        // v19: Recycle auth container (cleared and returned to pool for next user)
         try {
-          await destroyBrowserInstance(authSessionId);
-        } catch (destroyError) {
-          console.error(`⚠️ Failed to destroy auth container for ${authSessionId}`);
+          await recycleBrowserInstance(authSessionId);
+        } catch (recycleError) {
+          console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
         }
 
         return;
@@ -529,11 +547,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           }
         }
 
-        // Destroy auth container (auth containers should never be reused)
+        // v19: Recycle auth container (cleared and returned to pool for next user)
         try {
-          await destroyBrowserInstance(authSessionId);
-        } catch (destroyError) {
-          console.error(`⚠️ Failed to destroy auth container for ${authSessionId}`);
+          await recycleBrowserInstance(authSessionId);
+        } catch (recycleError) {
+          console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
         }
 
         return;
@@ -550,11 +568,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
   console.log(`⏰ Login timeout for auth ${authSessionId.substring(0, 8)}...`);
   authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
 
-  // Destroy timed-out auth container
+  // v19: Recycle timed-out auth container
   try {
-    await destroyBrowserInstance(authSessionId);
-  } catch (destroyError) {
-    console.error(`⚠️ Failed to destroy timed-out auth container for ${authSessionId}`);
+    await recycleBrowserInstance(authSessionId);
+  } catch (recycleError) {
+    console.error(`⚠️ Failed to recycle timed-out auth container for ${authSessionId}`);
   }
 }
 
@@ -1116,6 +1134,12 @@ app.post('/api/tiktok/execute', async (req, res) => {
     };
 
     if (isWebApi) {
+      // Determine correct referer based on endpoint (matches v2.4 stable behavior)
+      const isWatchHistory = request.endpoint.includes('/watch/history/');
+      const referer = isWatchHistory
+        ? 'https://www.tiktok.com/tpp/watch-history'
+        : 'https://www.tiktok.com/foryou';
+
       // Web API: Browser headers matching working v2.4 implementation
       requestHeaders = {
         ...requestHeaders,
@@ -1123,7 +1147,7 @@ app.post('/api/tiktok/execute', async (req, res) => {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.tiktok.com/foryou',
+        'Referer': referer,
         'Origin': 'https://www.tiktok.com',
         'Connection': 'keep-alive',
         'Sec-Fetch-Dest': 'empty',
