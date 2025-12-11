@@ -1242,6 +1242,106 @@ app.post('/api/tiktok/execute', async (req, res) => {
 
 // ============================================================================
 
+// ============================================================================
+// MIGRATION ENDPOINT (v2.4 → perf branch cookie migration)
+// ============================================================================
+
+/**
+ * Process ALL pending cookie migrations
+ * Loops through all users with plaintext cookies, encrypts with TEE key,
+ * stores in tee_encrypted_cookies, clears temp column.
+ *
+ * POST /migrate/process-pending
+ * Requires X-Migration-Key header matching MIGRATION_TRIGGER_KEY env var
+ */
+app.post('/migrate/process-pending', async (req, res) => {
+  // Auth: require migration trigger key
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
+  const xordiApiKey = process.env.XORDI_API_KEY;
+
+  if (!xordiApiKey) {
+    return res.status(500).json({ error: 'XORDI_API_KEY not configured' });
+  }
+
+  let totalSuccess = 0;
+  let totalFailed = 0;
+  let batchCount = 0;
+
+  try {
+    // Loop until no more pending users
+    while (true) {
+      batchCount++;
+
+      // Get next batch of users (100 at a time)
+      const pendingResponse = await axios.get(
+        `${xordiApiUrl}/api/enclave/migrate/pending`,
+        { headers: { 'X-Api-Key': xordiApiKey } }
+      );
+
+      const pendingUsers = pendingResponse.data.users || [];
+
+      // Exit loop when no more pending
+      if (pendingUsers.length === 0) {
+        console.log(`✅ Migration complete after ${batchCount} batches`);
+        break;
+      }
+
+      console.log(`🔄 Batch ${batchCount}: Processing ${pendingUsers.length} users...`);
+
+      for (const user of pendingUsers) {
+        try {
+          // Parse plaintext cookies (already in array format)
+          const cookies = user._migration_cookies_plaintext;
+
+          // Encrypt with TEE key
+          const encryptedHex = teeCrypto.encryptCookies(cookies);
+
+          // Store encrypted cookies and clear temp column
+          await axios.post(
+            `${xordiApiUrl}/api/enclave/migrate/complete`,
+            {
+              sec_user_id: user.sec_user_id,
+              tee_encrypted_cookies: encryptedHex
+            },
+            { headers: { 'X-Api-Key': xordiApiKey } }
+          );
+
+          totalSuccess++;
+        } catch (err: any) {
+          totalFailed++;
+          console.error(`❌ ${user.sec_user_id}: ${err.message}`);
+        }
+      }
+
+      console.log(`   Batch ${batchCount} done: ${totalSuccess} success, ${totalFailed} failed so far`);
+    }
+
+    res.json({
+      success: true,
+      processed: totalSuccess,
+      failed: totalFailed,
+      batches: batchCount
+    });
+
+  } catch (error: any) {
+    console.error('Migration processing failed:', error);
+    res.status(500).json({
+      error: error.message,
+      processed_before_error: totalSuccess,
+      failed_before_error: totalFailed
+    });
+  }
+});
+
+// ============================================================================
+
 const startTime = Date.now();
 
 app.get('/health', (req, res) => {
