@@ -99,10 +99,10 @@ class BrowserManager {
 
       // VPN proxy configuration (random bucket for QR auth load balancing)
       if (process.env.ENABLE_VPN_ROUTING === 'true') {
-        // Random bucket selection (0-3) for load balancing across Chisel tunnels
-        const bucket = Math.floor(Math.random() * 4);
-        const proxyArg = `--proxy-server=socks5://chisel-client-${bucket}:1080`;
-        console.log(`🌐 Container ${containerId} assigned to chisel-client-${bucket}`);
+        // Random bucket selection (0-9) for load balancing across WireGuard buckets
+        const bucket = Math.floor(Math.random() * 10);
+        const proxyArg = `--proxy-server=socks5://wg-bucket-${bucket}:1080`;
+        console.log(`🌐 Container ${containerId} assigned to wg-bucket-${bucket}`);
         dockerCmd.push('--env', `CHROMIUM_PROXY_ARG=${proxyArg}`);
       }
 

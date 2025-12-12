@@ -1183,7 +1183,7 @@ app.post('/api/tiktok/execute', async (req, res) => {
     // 7. Execute HTTP request to TikTok (FROM TEE)
     const baseUrl = isWebApi ? 'https://www.tiktok.com' : 'https://api16-normal-c-useast1a.tiktokv.com';
 
-    // WireGuard VPN routing: Use user's assigned bucket (0-3) if enabled
+    // WireGuard VPN routing: Use user's assigned bucket (0-9) if enabled
     const disableWireguardRouting = process.env.DISABLE_WIREGUARD_ROUTING === 'true';
     let proxyAgent = null;
 
