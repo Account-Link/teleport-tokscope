@@ -373,6 +373,26 @@ class BrowserAutomationClient {
   }
 
   static async extractAuthData(page: Page): Promise<SessionData> {
+    // CRITICAL FIX (v3-m): Extract cookies FIRST, before any navigation
+    // This matches v2.4 behavior that worked reliably for months
+    // The /profile navigation was corrupting/losing cookies
+    console.log('Extracting cookies from current page...');
+
+    // Filter to TikTok domain only - prevents capturing Google NID from CAPTCHAs
+    const cookies = await page.context().cookies(['https://www.tiktok.com']);
+    const cookieNames = cookies.map(c => c.name);
+    console.log(`Found ${cookies.length} TikTok cookies: ${cookieNames.join(', ') || 'none'}`);
+
+    // Validate sessionid exists - fail fast if auth didn't work
+    if (!cookieNames.includes('sessionid')) {
+      console.error('Validation failed: missing sessionid');
+      throw new Error('Auth failed: missing sessionid cookie');
+    }
+    console.log('Validation passed: sessionid present');
+
+    // Now navigate to profile to extract user data
+    // Cookies are already captured, so navigation issues won't affect them
+    console.log('Navigating to profile for user data...');
     await page.goto('https://www.tiktok.com/profile', {
       waitUntil: 'domcontentloaded',
       timeout: 30000
@@ -381,13 +401,14 @@ class BrowserAutomationClient {
     await page.waitForTimeout(3000);
 
     const userData = await BrowserAutomationClient.extractUserData(page);
-    const cookies = await page.context().cookies();
     const tokens = BrowserAutomationClient.extractTokensFromCookies(cookies);
     const deviceIds = BrowserAutomationClient.generateDeviceIds(userData.sec_user_id || '');
 
+    console.log(`Auth complete: user=${userData.sec_user_id?.substring(0, 8)}..., cookies=${cookies.length}`);
+
     return {
       user: userData,
-      cookies: cookies,
+      cookies: cookies,  // Use cookies captured BEFORE navigation
       tokens: {
         ...tokens,
         device_id: deviceIds.deviceId,
@@ -396,7 +417,7 @@ class BrowserAutomationClient {
       metadata: {
         extracted_at: new Date().toISOString(),
         user_agent: await page.evaluate(() => navigator.userAgent),
-        extraction_method: 'browser-automation-client'
+        extraction_method: 'browser-automation-client-v3m'
       }
     };
   }

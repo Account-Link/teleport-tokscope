@@ -84,17 +84,18 @@ class QRExtractor {
         });
 
         // Log it in Node.js context (will show in docker logs)
-        console.log('=== DOM INSPECTION ===');
-        console.log('Document title:', domInspection.title);
-        console.log('Page readyState:', domInspection.readyState);
-        console.log('Total elements:', domInspection.totalElements);
-        console.log('Canvas elements:', domInspection.canvasCount);
-        console.log('IMG elements:', domInspection.imgCount);
-        console.log('QR-related elements:', domInspection.qrRelatedCount);
-        console.log('Body innerHTML length:', domInspection.bodyLength);
-        console.log('QR elements sample:', JSON.stringify(domInspection.qrElements, null, 2));
-        console.log('ALL IMAGES INFO:', JSON.stringify(domInspection.allImagesInfo, null, 2));
-        console.log('==================');
+        // VERBOSE LOGGING COMMENTED OUT - uncomment for debugging
+        // console.log('=== DOM INSPECTION ===');
+        // console.log('Document title:', domInspection.title);
+        // console.log('Page readyState:', domInspection.readyState);
+        // console.log('Total elements:', domInspection.totalElements);
+        // console.log('Canvas elements:', domInspection.canvasCount);
+        // console.log('IMG elements:', domInspection.imgCount);
+        // console.log('QR-related elements:', domInspection.qrRelatedCount);
+        // console.log('Body innerHTML length:', domInspection.bodyLength);
+        // console.log('QR elements sample:', JSON.stringify(domInspection.qrElements, null, 2));
+        // console.log('ALL IMAGES INFO:', JSON.stringify(domInspection.allImagesInfo, null, 2));
+        // console.log('==================');
 
         // Now do actual extraction
         return await page.evaluate(async () => {
@@ -135,8 +136,9 @@ class QRExtractor {
         // IMG is usually promotional QR (slow CORS load, 57+ seconds)
         // Strategy: Wait for Canvas to render instead of processing IMG
         if (images.length > 0 && canvases.length === 0) {
-          console.log('⏭️  Skipping IMG elements - waiting for Canvas to render (optimization)');
-          console.log(`   Found ${images.length} IMG but 0 Canvas - will retry`);
+          // Commented out - too spammy on retries
+          // console.log('⏭️  Skipping IMG elements - waiting for Canvas to render (optimization)');
+          // console.log(`   Found ${images.length} IMG but 0 Canvas - will retry`);
           return null; // Trigger retry loop to wait for Canvas
         }
 
@@ -206,7 +208,10 @@ class QRExtractor {
       // If first attempt failed, retry up to 30 times with 0.2s intervals (max 6s total)
       while (!qrData && extractionAttempts < maxExtractionAttempts) {
         extractionAttempts++;
-        console.log(`⚠️ Extraction attempt ${extractionAttempts}/${maxExtractionAttempts} failed, retrying in 0.2s...`);
+        // Only log every 10 attempts to reduce spam
+        if (extractionAttempts % 10 === 0) {
+          console.log(`⚠️ QR extraction retry ${extractionAttempts}/${maxExtractionAttempts}...`);
+        }
         await page.waitForTimeout(200);
         qrData = await attemptExtraction();
       }

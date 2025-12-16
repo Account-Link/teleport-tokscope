@@ -94,7 +94,7 @@ class AuthSessionManager {
     this.authSessions.delete(authSessionId);
   }
 
-  cleanupExpired(): void {
+  async cleanupExpired(): Promise<void> {
     const now = Date.now();
     const expired: string[] = [];
 
@@ -104,10 +104,23 @@ class AuthSessionManager {
       }
     }
 
-    expired.forEach(authSessionId => {
+    for (const authSessionId of expired) {
       console.log(`🧹 Cleaning up expired auth session: ${authSessionId.substring(0, 8)}...`);
+
+      // CRITICAL: Release the browser container BEFORE removing session
+      try {
+        await recycleBrowserInstance(authSessionId);
+        console.log(`✅ Released container for expired session ${authSessionId.substring(0, 8)}...`);
+      } catch (e) {
+        console.error(`⚠️ Failed to release container for ${authSessionId}:`, e);
+      }
+
       this.removeAuthSession(authSessionId);
-    });
+    }
+
+    if (expired.length > 0) {
+      console.log(`🧹 Cleaned up ${expired.length} expired sessions`);
+    }
   }
 }
 
@@ -121,7 +134,7 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     throw new Error(`Failed to get browser instance: ${response.statusText}`);
   }
   const result = await response.json();
-  console.log(`🔄 Browser instance assigned:`, result);
+  console.log(`🔄 Browser instance assigned: ${result.container.containerId?.substring(0, 20)}... (IP: ${result.container.ip}, CDP: ${result.container.cdpUrl})`);
 
   let browser = null;
   const maxRetries = 3;
@@ -136,7 +149,7 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     }
   }
 
-  return { browser: browser!, containerId: result.container.id, cdpUrl: result.container.cdpUrl };
+  return { browser: browser!, containerId: result.container.containerId, cdpUrl: result.container.cdpUrl };
 }
 
 async function releaseBrowserInstance(sessionId: string): Promise<void> {
@@ -414,19 +427,34 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // Connect to browser
         const contexts = browserInstance.browser.contexts();
         const context = contexts[0] || await browserInstance.browser.newContext();
-        authPage = await context.newPage();
+
+        // Use existing page (pre-warmed and reloaded through proxy by browser-manager)
+        const pages = context.pages();  // Note: pages() returns Page[], not Promise
+        if (pages.length > 0) {
+          authPage = pages[0];
+          console.log(`♻️ Using existing pre-warmed page for auth ${authSessionId.substring(0, 8)}...`);
+        } else {
+          // Fallback: create new page if none exists
+          authPage = await context.newPage();
+          console.log(`📄 Created new page for auth ${authSessionId.substring(0, 8)}... (no pre-warmed page)`);
+        }
 
         authSessionManager.updateAuthSession(authSessionId, {
           browser: browserInstance.browser,
           page: authPage
         });
 
-        // Navigate to QR login page
-        console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
-        await authPage.goto('https://www.tiktok.com/login/qrcode', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
+        // Navigate to QR login page (skip if already there from pre-warm)
+        const currentUrl = authPage.url();
+        if (!currentUrl.includes('/login/qrcode')) {
+          console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
+          await authPage.goto('https://www.tiktok.com/login/qrcode', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+        } else {
+          console.log(`✅ Page already on QR login for auth ${authSessionId.substring(0, 8)}...`);
+        }
 
         // Extract and decode QR code (with sessionId for metrics tracking)
         const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
@@ -520,42 +548,9 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         return;
       }
 
-      // FALLBACK: Check URL change (slow - backup detection method)
-      const url = page.url();
-
-      if (url.includes('/foryou') ||
-          url.includes('/home') ||
-          (url.includes('tiktok.com') && !url.includes('/login'))) {
-        console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}... (detected via URL navigation)`);
-
-        // Extract session data (cookies in plaintext - INSIDE TEE)
-        const sessionData = await extractAuthData(page);
-
-        authSessionManager!.updateAuthSession(authSessionId, {
-          status: 'complete',
-          sessionData
-        });
-
-        // TEE Integration: Encrypt and store via Xordi
-        if (preAuthToken && sessionData) {
-          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
-        } else {
-          // Legacy flow: Store session locally (fallback)
-          if (sessionManager && sessionData) {
-            const newSessionId = sessionManager.storeSession(sessionData);
-            console.log(`💾 Session stored locally: ${newSessionId.substring(0, 8)}...`);
-          }
-        }
-
-        // v19: Recycle auth container (cleared and returned to pool for next user)
-        try {
-          await recycleBrowserInstance(authSessionId);
-        } catch (recycleError) {
-          console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
-        }
-
-        return;
-      }
+      // v3-n: Only trust sessionid cookie detection (matches v2.4)
+      // URL navigation detection removed - it triggered before cookies were set,
+      // causing extractAuthData failures and log spam
 
       await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -985,7 +980,23 @@ app.get('/containers', async (req, res) => {
  */
 app.post('/api/tiktok/execute', async (req, res) => {
   try {
-    const { sec_user_id, wireguard_bucket, request } = req.body;
+    const { sec_user_id, wireguard_bucket, ipfoxy_session, request } = req.body;
+
+    // AUTH_ONLY_MODE: Reject data operations on auth-only instances
+    if (process.env.AUTH_ONLY_MODE === 'true') {
+      const operation = req.body.request?.operation;
+      const authOperations = ['qr_auth', 'qr_auth_check', 'qr_auth_confirm'];
+
+      if (!authOperations.includes(operation)) {
+        console.log(`🚫 Rejecting ${operation} - instance is auth-only`);
+        return res.status(503).json({
+          error: 'Instance is auth-only',
+          message: 'This instance only handles authentication operations. Data operations (timeline, watch_history, like) should be routed to the Main TEE.',
+          operation,
+          instance_id: process.env.INSTANCE_ID || 'unknown'
+        });
+      }
+    }
 
     // 1. Verify Xordi API key
     const apiKey = req.header('X-Api-Key');
@@ -1095,6 +1106,24 @@ app.post('/api/tiktok/execute', async (req, res) => {
       return res.status(404).json({ error: 'No session data available for user' });
     }
 
+    // XORDI-V3-L FIX: Extract fresh msToken from decrypted cookies
+    // Override any stale msToken that was baked into the request URL by DirectTikTokAPI
+    const freshMsToken = cookies.find((c: any) => c.name === 'msToken')?.value || '';
+
+    if (freshMsToken && request.endpoint) {
+      try {
+        const url = new URL(request.endpoint, 'https://www.tiktok.com');
+        if (url.searchParams.has('msToken')) {
+          const oldMsToken = url.searchParams.get('msToken');
+          url.searchParams.set('msToken', freshMsToken);
+          request.endpoint = url.pathname + url.search;
+          console.log(`🔄 Replaced msToken in URL with fresh value from cookies`);
+        }
+      } catch (urlError) {
+        console.log(`⚠️ Could not parse endpoint as URL, skipping msToken injection`);
+      }
+    }
+
     // 4. Detect API type (web vs mobile)
     const apiType = request.apiType || 'mobile';
     const isWebApi = apiType === 'web';
@@ -1183,17 +1212,46 @@ app.post('/api/tiktok/execute', async (req, res) => {
     // 7. Execute HTTP request to TikTok (FROM TEE)
     const baseUrl = isWebApi ? 'https://www.tiktok.com' : 'https://api16-normal-c-useast1a.tiktokv.com';
 
-    // WireGuard VPN routing: Use user's assigned bucket (0-9) if enabled
+    // Proxy routing: IPFoxy (per-user sticky sessions) or WireGuard (bucket-based)
+    const proxyMode = process.env.PROXY_MODE || 'wireguard';
     const disableWireguardRouting = process.env.DISABLE_WIREGUARD_ROUTING === 'true';
     let proxyAgent = null;
 
-    if (!disableWireguardRouting && wireguard_bucket !== null && wireguard_bucket !== undefined) {
-      const bucket = wireguard_bucket;
-      const socksProxy = `socks5://wg-bucket-${bucket}:1080`;
+    if (proxyMode === 'ipfoxy') {
+      if (!ipfoxy_session) {
+        return res.status(400).json({ error: 'ipfoxy_session required when PROXY_MODE=ipfoxy' });
+      }
+
+      const account = process.env.IPFOXY_ACCOUNT;
+      const password = process.env.IPFOXY_PASSWORD;
+      const gateway = process.env.IPFOXY_GATEWAY || 'gate-us.ipfoxy.io:58688';
+
+      const ipfoxyUser = `customer-${account}-cc-US-sessid-${ipfoxy_session}-ttl-60`;
+      const socksProxy = `socks5://${ipfoxyUser}:${password}@${gateway}`;
       proxyAgent = new SocksProxyAgent(socksProxy);
-      console.log(`🌐 Routing request through ${socksProxy} for user ${sec_user_id.substring(0, 16)}...`);
+
+      console.log(`🌐 Routing through IPFoxy (session: ${ipfoxy_session.substring(0, 8)}...) for user ${sec_user_id.substring(0, 16)}...`);
+
+    } else if (proxyMode === 'wireguard' && wireguard_bucket !== null && wireguard_bucket !== undefined) {
+      // WireGuard buckets run on borgcube, connect via external SOCKS5
+      const wgHost = process.env.WIREGUARD_HOST || '162.251.235.136';
+      const wgBasePort = parseInt(process.env.WIREGUARD_BASE_PORT || '10800');
+      const wgUser = process.env.WG_PROXY_USER;
+      const wgPass = process.env.WG_PROXY_PASS;
+
+      if (!wgUser || !wgPass) {
+        console.error('❌ WG_PROXY_USER/WG_PROXY_PASS not configured');
+        return res.status(500).json({ error: 'WireGuard credentials not configured' });
+      }
+
+      const port = wgBasePort + wireguard_bucket;
+      const socksProxy = `socks5://${wgUser}:${wgPass}@${wgHost}:${port}`;
+      proxyAgent = new SocksProxyAgent(socksProxy);
+
+      console.log(`🌐 [wireguard] bucket ${wireguard_bucket} → ${wgHost}:${port}`);
+
     } else {
-      console.log(`🌐 Using direct connection (WireGuard routing disabled)`);
+      console.log(`🌐 Using direct connection (no proxy configured)`);
     }
 
     // For web API, endpoint already has query string; for mobile API, use params
@@ -1347,18 +1405,51 @@ const startTime = Date.now();
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    system: 'healthy',
-    sessions: sessionManager?.getSessionCount() || 0,
-    activeSessions: sessionManager?.getSessionCount() || 0,
-    maxSessions: 50,
+    instance_id: process.env.INSTANCE_ID || 'main',
+    auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
     uptime: (Date.now() - startTime) / 1000,
+    sessions: sessionManager?.getSessionCount() || 0,
     dstack: !!dstackSDK,
     encryption: !!encryptionKey,
-    modules: {
-      web: !!process.env.WEB_AUTH_MODULE_URL,
-      mobile: !!process.env.MOBILE_AUTH_MODULE_URL
-    }
+    timestamp: new Date().toISOString()
   });
+});
+
+// Readiness check - can accept requests
+app.get('/ready', async (req, res) => {
+  try {
+    // Check if browser-manager is reachable and has capacity
+    const bmUrl = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
+    const response = await axios.get(`${bmUrl}/stats`, { timeout: 5000 });
+
+    const { available, total, authSlotsAvailable } = response.data;
+
+    if (available > 0 || (authSlotsAvailable !== undefined && authSlotsAvailable > 0)) {
+      res.json({
+        status: 'ready',
+        instance_id: process.env.INSTANCE_ID || 'main',
+        auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
+        capacity: {
+          containers_available: available,
+          containers_total: total,
+          auth_slots_available: authSlotsAvailable
+        }
+      });
+    } else {
+      res.status(503).json({
+        status: 'not_ready',
+        reason: 'no_available_capacity',
+        instance_id: process.env.INSTANCE_ID || 'main'
+      });
+    }
+  } catch (error: any) {
+    res.status(503).json({
+      status: 'not_ready',
+      reason: 'browser_manager_unavailable',
+      error: error.message,
+      instance_id: process.env.INSTANCE_ID || 'main'
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
@@ -1380,8 +1471,8 @@ async function startServer(): Promise<void> {
   console.log('🔐 Xordi security module initialized');
 
   // Cleanup expired auth sessions periodically
-  setInterval(() => {
-    authSessionManager?.cleanupExpired();
+  setInterval(async () => {
+    await authSessionManager?.cleanupExpired();
   }, 60000); // Every minute
 
   app.listen(PORT, () => {

@@ -97,14 +97,10 @@ class BrowserManager {
         dockerCmd.push('--memory-reservation', process.env.BROWSER_MEMORY_RESERVATION);
       }
 
-      // VPN proxy configuration (random bucket for QR auth load balancing)
-      if (process.env.ENABLE_VPN_ROUTING === 'true') {
-        // Random bucket selection (0-9) for load balancing across WireGuard buckets
-        const bucket = Math.floor(Math.random() * 10);
-        const proxyArg = `--proxy-server=socks5://wg-bucket-${bucket}:1080`;
-        console.log(`🌐 Container ${containerId} assigned to wg-bucket-${bucket}`);
-        dockerCmd.push('--env', `CHROMIUM_PROXY_ARG=${proxyArg}`);
-      }
+      // Proxy is configured JIT when container is assigned for auth
+      // Browser uses local relay at 127.0.0.1:1080 (hardcoded in chromium.conf)
+      // Relay starts in passthrough mode, configured with IPFoxy when assigned
+      console.log(`🌐 Container ${containerId} using local relay (passthrough until assigned)`);
 
       // Add image name as final argument
       dockerCmd.push(process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest');
@@ -177,7 +173,7 @@ class BrowserManager {
 
           // Navigate to QR page (one-time cost ~6s)
           await page.goto('https://www.tiktok.com/login/qrcode', {
-            waitUntil: 'networkidle',
+            waitUntil: 'domcontentloaded',
             timeout: 30000
           });
 
@@ -248,11 +244,9 @@ class BrowserManager {
     let containerId = this.containerPool.pop();
 
     if (!containerId) {
-      containerId = await this.createContainer();
-      const index = this.containerPool.indexOf(containerId);
-      if (index > -1) {
-        this.containerPool.splice(index, 1);
-      }
+      // Pool exhausted = at capacity. Don't create more containers.
+      // Let the request fail so auto-scaler can spin up a new machine.
+      throw new Error('No available containers - capacity reached');
     }
 
     const containerInfo = this.containers.get(containerId);
@@ -266,24 +260,107 @@ class BrowserManager {
 
     this.sessionToContainer.set(sessionId, containerId);
 
-    // v19: Fast reload if page is pre-warmed
-    if (ENABLE_PERSISTENT_RECYCLING && containerInfo.page) {
+    // JIT: Configure IPFoxy proxy now that container is being used for auth
+    try {
+      await this.configureContainerProxy(containerInfo);
+    } catch (proxyError: any) {
+      console.error(`❌ Failed to configure proxy: ${proxyError.message}`);
+      // Return container to pool since assignment failed
+      containerInfo.status = 'pooled';
+      this.containerPool.push(containerId);
+      this.sessionToContainer.delete(sessionId);
+      throw proxyError;
+    }
+
+    // Reload existing page through proxy to get fresh QR with residential IP
+    if (containerInfo.page) {
       try {
-        console.log(`🔄 Refreshing pre-warmed QR page for ${sessionId.substring(0, 8)}...`);
-        await containerInfo.page.reload({
+        console.log(`🔄 Reloading QR page through proxy for ${sessionId.substring(0, 8)}...`);
+        await containerInfo.page.goto('https://www.tiktok.com/login/qrcode', {
           waitUntil: 'domcontentloaded',
-          timeout: 5000
+          timeout: 30000
         });
-        console.log(`✅ Container assigned ${containerId.substring(0, 16)}... to session ${sessionId.substring(0, 8)}... (reused, session #${containerInfo.sessionCount + 1})`);
+        await containerInfo.page.waitForSelector('img[alt="qrcode"]', {
+          timeout: 10000,
+          state: 'visible'
+        });
+        console.log(`✅ Container ${containerId.substring(0, 16)}... ready for auth (proxy active)`);
       } catch (reloadError: any) {
-        console.error(`⚠️ Page reload failed for ${containerId}: ${reloadError.message}`);
-        console.log(`📦 Container assigned without reload`);
+        console.error(`❌ Page reload failed: ${reloadError.message}`);
+        throw reloadError;
       }
-    } else {
-      console.log(`📦 Assigned container ${containerId.substring(0, 16)}... to session ${sessionId.substring(0, 8)}...`);
     }
 
     return containerInfo;
+  }
+
+  private async configureContainerProxy(containerInfo: ContainerInfo): Promise<void> {
+    const proxyMode = process.env.PROXY_MODE || 'ipfoxy';
+    const controlUrl = `http://${containerInfo.ip}:1081/configure`;
+
+    let configPayload: string;
+    let logMessage: string;
+
+    if (proxyMode === 'wireguard') {
+      // WireGuard mode: Connect to borgcube SOCKS5 buckets
+      const wgHost = process.env.WIREGUARD_HOST || '162.251.235.136';
+      const wgBasePort = parseInt(process.env.WIREGUARD_BASE_PORT || '10800');
+      const wgUser = process.env.WG_PROXY_USER;
+      const wgPass = process.env.WG_PROXY_PASS;
+
+      if (!wgUser || !wgPass) {
+        throw new Error('WG_PROXY_USER/WG_PROXY_PASS not configured for wireguard mode');
+      }
+
+      // Random bucket for QR auth (no sec_user_id yet - will be assigned deterministically after login)
+      const bucket = Math.floor(Math.random() * 10);
+      const port = wgBasePort + bucket;
+
+      configPayload = JSON.stringify({
+        host: wgHost,
+        port: port,
+        user: wgUser,
+        pass: wgPass
+      });
+
+      logMessage = `🌐 Container ${containerInfo.containerId.substring(0, 16)}... proxy configured (wireguard bucket ${bucket})`;
+
+    } else {
+      // IPFoxy mode (default)
+      const ipfoxyAccount = process.env.IPFOXY_ACCOUNT;
+      const ipfoxyPassword = process.env.IPFOXY_PASSWORD;
+
+      if (!ipfoxyAccount || !ipfoxyPassword) {
+        console.log(`⚠️ IPFoxy credentials not configured, skipping proxy setup`);
+        return;
+      }
+
+      // Generate unique session ID for this auth request (NO hyphens - IPFoxy rejects them)
+      const sessionId = `${Date.now()}${Math.random().toString(36).substr(2, 6)}`;
+      const upstreamUser = `customer-${ipfoxyAccount}-cc-US-sessid-${sessionId}-ttl-60`;
+
+      configPayload = JSON.stringify({
+        host: 'gate-us.ipfoxy.io',
+        port: 58688,
+        user: upstreamUser,
+        pass: ipfoxyPassword
+      });
+
+      logMessage = `🌐 Container ${containerInfo.containerId.substring(0, 16)}... proxy configured (ipfoxy session: ${sessionId})`;
+    }
+
+    // POST to relay control endpoint inside container
+    const response = await fetch(controlUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: configPayload
+    });
+
+    if (!response.ok) {
+      throw new Error(`Relay config failed: ${response.status}`);
+    }
+
+    console.log(logMessage);
   }
 
   async releaseContainer(sessionId: string): Promise<void> {
@@ -501,6 +578,7 @@ class BrowserManager {
 
         if (currentPoolSize < MIN_POOL_SIZE) {
           const needed = MIN_POOL_SIZE - currentPoolSize;
+
           console.log(`🔧 Pool below minimum (${currentPoolSize}/${MIN_POOL_SIZE}). Creating ${needed} containers...`);
 
           // PARALLEL CREATION: Create all needed containers at once (faster)
@@ -614,7 +692,7 @@ async function main() {
       const { sessionId } = req.params;
       console.log(`🔄 Browser manager received assign request for session: ${sessionId.substring(0, 8)}...`);
       const container = await browserManager.assignContainer(sessionId);
-      console.log(`🔄 Browser manager assigned container:`, container);
+      console.log(`🔄 Browser manager assigned container: ${container.containerId.substring(0, 20)}... (IP: ${container.ip})`);
       res.json({ container });
     } catch (error) {
       console.error('Failed to assign container:', error);
