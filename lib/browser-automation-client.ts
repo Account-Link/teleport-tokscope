@@ -378,17 +378,20 @@ class BrowserAutomationClient {
     // The /profile navigation was corrupting/losing cookies
     console.log('Extracting cookies from current page...');
 
-    // Filter to TikTok domain only - prevents capturing Google NID from CAPTCHAs
-    const cookies = await page.context().cookies(['https://www.tiktok.com']);
+    // Get ALL cookies - requiredCookies check handles filtering (v3-t)
+    const cookies = await page.context().cookies();
     const cookieNames = cookies.map(c => c.name);
-    console.log(`Found ${cookies.length} TikTok cookies: ${cookieNames.join(', ') || 'none'}`);
+    console.log(`Found ${cookies.length} cookies, checking for required auth cookies...`);
 
-    // Validate sessionid exists - fail fast if auth didn't work
-    if (!cookieNames.includes('sessionid')) {
-      console.error('Validation failed: missing sessionid');
-      throw new Error('Auth failed: missing sessionid cookie');
+    // v3-o: Validate ALL 6 required cookies - this is what working extractions have
+    const requiredCookies = ['sessionid', 'msToken', 'ttwid', 'sid_guard', 'uid_tt', 'sid_tt'];
+
+    const missingRequired = requiredCookies.filter(name => !cookieNames.includes(name));
+    if (missingRequired.length > 0) {
+      console.error(`Validation failed: missing cookies: ${missingRequired.join(', ')}`);
+      throw new Error(`Auth failed: missing cookies: ${missingRequired.join(', ')}`);
     }
-    console.log('Validation passed: sessionid present');
+    console.log(`Validation passed: ${requiredCookies.length}/${requiredCookies.length} cookies present`);
 
     // Now navigate to profile to extract user data
     // Cookies are already captured, so navigation issues won't affect them

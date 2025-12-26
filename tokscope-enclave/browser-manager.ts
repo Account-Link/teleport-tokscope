@@ -1,10 +1,10 @@
 import { execSync } from 'child_process';
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+// v3-v: Removed Playwright - browser-manager is Docker lifecycle only
+// tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
 
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
-const ENABLE_PERSISTENT_RECYCLING = process.env.ENABLE_PERSISTENT_RECYCLING !== 'false'; // v19 feature flag
 
 interface Config {
   tcb: {
@@ -12,18 +12,15 @@ interface Config {
   };
 }
 
+// v3-v: Simplified - no browser/context/page (server.ts owns CDP)
 interface ContainerInfo {
   containerId: string;
   shortId: string;
   ip: string;
   cdpUrl: string;
-  browser: Browser | null;
-  context: BrowserContext | null;  // v19: Persistent context for recycling
-  page: Page | null;               // v19: Persistent page for pre-warming
-  sessionCount: number;            // v19: Track usage for lifecycle management
   createdAt: number;
   lastUsed: number;
-  status: 'warming' | 'pooled' | 'assigned' | 'released' | 'recycling';  // v19: Added warming, recycling
+  status: 'pooled' | 'assigned' | 'released';
   sessionId: string | null;
 }
 
@@ -53,6 +50,38 @@ class BrowserManager {
 
   private generateContainerId(): string {
     return `tcb-browser-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+  }
+
+  /**
+   * v3-v: Wait for browser to be ready via HTTP endpoint (no CDP required)
+   * Chrome's DevTools Protocol exposes /json/version for health checks
+   */
+  private async waitForBrowserReady(ip: string, maxRetries = 10): Promise<void> {
+    const cdpVersionUrl = `http://${ip}:9223/json/version`;
+
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+
+        const response = await fetch(cdpVersionUrl, {
+          signal: controller.signal
+        });
+        clearTimeout(timeout);
+
+        if (response.ok) {
+          const data = await response.json();
+          console.log(`✅ Browser ready: ${data.Browser || 'Chromium'}`);
+          return;
+        }
+      } catch (error: any) {
+        if (error.name !== 'AbortError') {
+          console.log(`🔄 Browser not ready yet (attempt ${i + 1}/${maxRetries})`);
+        }
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    throw new Error('Browser failed to become ready within timeout');
   }
 
   async createContainer(): Promise<string> {
@@ -137,76 +166,24 @@ class BrowserManager {
       const containerIP = execSync(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`, { encoding: 'utf8' }).trim();
       console.log(`📍 Container IP: ${containerIP}`);
 
+      // v3-v: Wait for browser ready via HTTP (NO CDP connection)
+      // tokscope-enclave (server.ts) will create the single CDP connection
       const cdpUrl = `http://${containerIP}:9223`;
-      let browser = null;
-      let browserRetries = 0;
-      while (browserRetries < 10) {
-        try {
-          browser = await chromium.connectOverCDP(cdpUrl);
-          const page = await browser.newPage();
-          await page.close();
-          console.log(`🌐 Browser connection successful for ${containerId}`);
-          break;
-        } catch (error: any) {
-          console.log(`🔄 Browser connection attempt ${browserRetries + 1}/10 failed: ${error.message}`);
-          browserRetries++;
-          if (browserRetries >= 10) {
-            throw new Error(`Failed to connect to browser in container ${containerId}: ${error.message}`);
-          }
-          await new Promise(resolve => setTimeout(resolve, 3000));
-        }
-      }
+      await this.waitForBrowserReady(containerIP);
 
-      // v19: Pre-warm container with QR page (if recycling enabled)
-      let context: BrowserContext | null = null;
-      let page: Page | null = null;
-      let finalStatus: ContainerInfo['status'] = 'pooled';
-
-      if (true) {  // Always pre-warm containers for fast QR extraction (recycling controlled by ENABLE_PERSISTENT_RECYCLING flag)
-        try {
-          console.log(`🔥 Pre-warming container ${containerId.substring(0, 16)}... with QR page...`);
-          finalStatus = 'warming';
-
-          // Create persistent context (starts clean, no cookies by default)
-          context = await browser!.newContext();
-          page = await context.newPage();
-
-          // Navigate to QR page (one-time cost ~6s)
-          await page.goto('https://www.tiktok.com/login/qrcode', {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-          });
-
-          // Verify QR container loaded
-          await page.waitForSelector('img[alt="qrcode"]', {
-            timeout: 10000,
-            state: 'visible'
-          });
-
-          finalStatus = 'pooled';
-          console.log(`✅ Container ${containerId.substring(0, 16)}... pre-warmed (QR page loaded)`);
-        } catch (warmError: any) {
-          console.error(`⚠️ Pre-warming failed for ${containerId}: ${warmError.message}`);
-          console.log(`📦 Container will be available without pre-warming`);
-          finalStatus = 'pooled';
-          // Continue without pre-warming
-        }
-      }
-
+      // v3-v: Simplified ContainerInfo - no browser/context/page
       const containerInfo: ContainerInfo = {
         containerId,
         shortId: shortContainerId,
         ip: containerIP,
         cdpUrl,
-        browser,
-        context,              // v19: Store persistent context
-        page,                 // v19: Store persistent page
-        sessionCount: 0,      // v19: Initialize session counter
         createdAt: Date.now(),
         lastUsed: Date.now(),
-        status: finalStatus,
+        status: 'pooled',
         sessionId: null
       };
+
+      console.log(`✅ Container ${containerId.substring(0, 16)}... ready (awaiting CDP from server.ts)`);
 
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
@@ -260,7 +237,7 @@ class BrowserManager {
 
     this.sessionToContainer.set(sessionId, containerId);
 
-    // JIT: Configure IPFoxy proxy now that container is being used for auth
+    // JIT: Configure proxy now that container is being used for auth
     try {
       await this.configureContainerProxy(containerInfo);
     } catch (proxyError: any) {
@@ -272,24 +249,8 @@ class BrowserManager {
       throw proxyError;
     }
 
-    // Reload existing page through proxy to get fresh QR with residential IP
-    if (containerInfo.page) {
-      try {
-        console.log(`🔄 Reloading QR page through proxy for ${sessionId.substring(0, 8)}...`);
-        await containerInfo.page.goto('https://www.tiktok.com/login/qrcode', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
-        await containerInfo.page.waitForSelector('img[alt="qrcode"]', {
-          timeout: 10000,
-          state: 'visible'
-        });
-        console.log(`✅ Container ${containerId.substring(0, 16)}... ready for auth (proxy active)`);
-      } catch (reloadError: any) {
-        console.error(`❌ Page reload failed: ${reloadError.message}`);
-        throw reloadError;
-      }
-    }
+    // v3-v: NO navigation here - server.ts owns CDP and will navigate
+    console.log(`✅ Container ${containerId.substring(0, 16)}... assigned (proxy configured, awaiting CDP from server.ts)`);
 
     return containerInfo;
   }
@@ -385,120 +346,17 @@ class BrowserManager {
   }
 
   /**
-   * v19: Recycle container - Nuclear cleanup and return to pool
-   * This enables persistent containers that can be reused indefinitely
+   * v3-q: Destroy container after auth (no recycling - prevents state contamination)
+   * Pool maintenance will create fresh containers to maintain MIN_POOL_SIZE
    */
   async recycleContainer(sessionId: string): Promise<void> {
-    if (!ENABLE_PERSISTENT_RECYCLING) {
-      // Fallback to destroy behavior if recycling disabled
-      console.log(`⚠️ Persistent recycling disabled, destroying container instead`);
-      const containerId = this.sessionToContainer.get(sessionId);
-      if (containerId) {
-        await this.destroyContainer(containerId);
-      }
-      return;
-    }
-
-    if (!this.sessionToContainer.has(sessionId)) {
-      console.log(`⚠️ No container assigned to session ${sessionId.substring(0, 8)}...`);
-      return;
-    }
-
-    const containerId = this.sessionToContainer.get(sessionId)!;
-    const containerInfo = this.containers.get(containerId);
-
-    if (!containerInfo) {
-      console.log(`⚠️ Container for session ${sessionId} not found in registry`);
-      return;
-    }
-
-    containerInfo.status = 'recycling';
-    console.log(`♻️ Recycling container ${containerId.substring(0, 16)}... (session #${containerInfo.sessionCount})...`);
-
-    try {
-      if (!containerInfo.context || !containerInfo.page) {
-        throw new Error('Container missing context or page (not pre-warmed)');
-      }
-
-      // 1. Nuclear cleanup: Clear ALL browser state
-      await containerInfo.context.clearCookies();
-
-      // 2. Clear localStorage, sessionStorage, IndexedDB
-      await containerInfo.page.evaluate(() => {
-        localStorage.clear();
-        sessionStorage.clear();
-
-        // Clear IndexedDB
-        if (window.indexedDB && window.indexedDB.databases) {
-          window.indexedDB.databases().then(dbs => {
-            dbs.forEach(db => {
-              if (db.name) window.indexedDB.deleteDatabase(db.name);
-            });
-          });
-        }
-      });
-
-      // 3. Refresh to clean QR page (1-2s, JS cached!)
-      await containerInfo.page.goto('https://www.tiktok.com/login/qrcode', {
-        waitUntil: 'domcontentloaded',
-        timeout: 5000
-      });
-
-      // 4. Verify clean state
-      await containerInfo.page.waitForSelector('img[alt="qrcode"]', {
-        timeout: 10000,
-        state: 'visible'
-      });
-
-      // 5. Back to pool
-      containerInfo.status = 'pooled';
-      containerInfo.sessionId = null;
-      containerInfo.sessionCount++;
-      containerInfo.lastUsed = Date.now();
-
-      // Return to pool
-      this.containerPool.push(containerId);
-      this.sessionToContainer.delete(sessionId);
-
-      console.log(`✅ Container recycled (${containerInfo.sessionCount} total sessions, pool: ${this.containerPool.length}/${MIN_POOL_SIZE})`);
-
-      // 6. Periodic full restart (prevent memory leaks)
-      if (containerInfo.sessionCount >= 100) {
-        console.log(`🔄 Container ${containerId.substring(0, 16)}... hit 100 sessions, scheduling replacement...`);
-        // Don't await - do in background
-        this.replaceContainer(containerId).catch(err =>
-          console.error(`Failed to replace container ${containerId}:`, err.message)
-        );
-      }
-
-    } catch (error: any) {
-      console.error(`❌ Recycling failed for ${containerId.substring(0, 16)}...: ${error.message}`);
-      console.log(`🗑️ Falling back to destroy and replace`);
-
-      // Fallback: Destroy and replace container
-      try {
-        await this.destroyContainer(containerId);
-        // Pool maintenance will create a new one automatically
-      } catch (destroyError: any) {
-        console.error(`Failed to destroy failed container:`, destroyError.message);
-      }
-    }
-  }
-
-  /**
-   * v19: Replace a container with a fresh one (after 100 sessions or on error)
-   */
-  private async replaceContainer(containerId: string): Promise<void> {
-    console.log(`🔄 Replacing container ${containerId.substring(0, 16)}...`);
-
-    try {
-      // Destroy old container
+    const containerId = this.sessionToContainer.get(sessionId);
+    if (containerId) {
+      console.log(`🗑️ Destroying auth container for session ${sessionId.substring(0, 8)}...`);
       await this.destroyContainer(containerId);
-
-      // Pool maintenance will create a new one automatically to maintain MIN_POOL_SIZE
-      console.log(`✅ Container ${containerId.substring(0, 16)}... removed, pool maintenance will replenish`);
-    } catch (error: any) {
-      console.error(`Failed to replace container ${containerId}:`, error.message);
+      this.sessionToContainer.delete(sessionId);
+    } else {
+      console.log(`⚠️ No container found for session ${sessionId.substring(0, 8)}...`);
     }
   }
 
@@ -511,13 +369,8 @@ class BrowserManager {
 
     console.log(`🗑️  Destroying container: ${containerId.substring(0, 16)}...`);
 
-    if (containerInfo.browser) {
-      try {
-        await containerInfo.browser.close();
-      } catch (error: any) {
-        console.log(`⚠️  Failed to close browser for ${containerId}: ${error.message}`);
-      }
-    }
+    // v3-v: No browser.close() - we don't own the CDP connection
+    // server.ts owns the connection and is responsible for cleanup
 
     try {
       execSync(`docker rm -f ${containerId}`, { stdio: 'ignore' });

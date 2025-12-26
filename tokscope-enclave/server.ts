@@ -1,5 +1,5 @@
 import express from 'express';
-import { chromium, Browser, Page } from 'playwright';
+import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import jsQR from 'jsqr';
@@ -30,8 +30,11 @@ interface SessionData {
   install_id?: string;
 }
 
+// v3-v: Updated - server.ts now owns CDP connection and creates context/page
 interface BrowserInstance {
   browser: Browser;
+  context: BrowserContext;
+  page: Page;
   containerId: string;
   cdpUrl: string;
 }
@@ -53,6 +56,71 @@ interface AuthSession {
   qrDecodedUrl?: string | null;  // Magic link URL
   sessionData: SessionData | null;
   startedAt: number;
+}
+
+// v3-s: Debug screenshot storage (in-memory with TTL)
+interface DebugScreenshot {
+  buffer: Buffer;
+  timestamp: number;
+  authSessionId: string;
+  reason: string;
+  url: string;
+  title: string;
+}
+
+const debugScreenshots = new Map<string, DebugScreenshot>();
+const DEBUG_SCREENSHOT_TTL_MS = parseInt(process.env.DEBUG_SCREENSHOT_TTL_MS || '600000'); // 10 min default
+
+// Cleanup expired screenshots every minute
+setInterval(() => {
+  if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') return;
+  const now = Date.now();
+  for (const [token, screenshot] of debugScreenshots.entries()) {
+    if (now - screenshot.timestamp > DEBUG_SCREENSHOT_TTL_MS) {
+      debugScreenshots.delete(token);
+    }
+  }
+}, 60000);
+
+/**
+ * v3-s: Capture debug screenshot and return access URL
+ * Only runs when ENABLE_DEBUG_SCREENSHOTS=true
+ */
+async function captureDebugScreenshot(
+  page: Page,
+  authSessionId: string,
+  reason: string
+): Promise<string | null> {
+  if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
+    return null;
+  }
+
+  try {
+    const buffer = await page.screenshot({ fullPage: true });
+    const token = crypto.randomBytes(16).toString('hex');
+    const url = page.url();
+    const title = await page.title();
+
+    debugScreenshots.set(token, {
+      buffer,
+      timestamp: Date.now(),
+      authSessionId,
+      reason,
+      url,
+      title
+    });
+
+    // Log clickable URL (appears in docker logs)
+    const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
+    const screenshotUrl = `${baseUrl}/debug/screenshot/${token}`;
+    console.log(`📸 Debug screenshot: ${screenshotUrl}`);
+    console.log(`   Auth: ${authSessionId.substring(0, 8)}..., Reason: ${reason}`);
+
+    return token;
+  } catch (err: any) {
+    console.error(`⚠️ Screenshot capture failed: ${err.message}`);
+    return null;
+  }
 }
 
 class AuthSessionManager {
@@ -109,7 +177,7 @@ class AuthSessionManager {
 
       // CRITICAL: Release the browser container BEFORE removing session
       try {
-        await recycleBrowserInstance(authSessionId);
+        await destroyAuthContainer(authSessionId);
         console.log(`✅ Released container for expired session ${authSessionId.substring(0, 8)}...`);
       } catch (e) {
         console.error(`⚠️ Failed to release container for ${authSessionId}:`, e);
@@ -124,6 +192,11 @@ class AuthSessionManager {
   }
 }
 
+/**
+ * v3-v: Request browser instance - NOW CREATES THE ONLY CDP CONNECTION
+ * This is the fix for the dual CDP connection bug (Solution F)
+ * browser-manager only manages Docker lifecycle, we own CDP/context/page
+ */
 async function requestBrowserInstance(sessionId: string): Promise<BrowserInstance> {
   console.log(`🔄 Requesting browser instance from ${BROWSER_MANAGER_URL}/assign/${sessionId}`);
   const response = await fetch(`${BROWSER_MANAGER_URL}/assign/${sessionId}`, {
@@ -134,8 +207,10 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     throw new Error(`Failed to get browser instance: ${response.statusText}`);
   }
   const result = await response.json();
-  console.log(`🔄 Browser instance assigned: ${result.container.containerId?.substring(0, 20)}... (IP: ${result.container.ip}, CDP: ${result.container.cdpUrl})`);
+  console.log(`🔄 Container assigned: ${result.container.containerId?.substring(0, 20)}... (IP: ${result.container.ip})`);
 
+  // v3-v: Connect via CDP - THIS IS THE ONLY CONNECTION
+  // browser-manager no longer creates a CDP connection
   let browser = null;
   const maxRetries = 3;
   for (let i = 0; i < maxRetries; i++) {
@@ -149,7 +224,20 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     }
   }
 
-  return { browser: browser!, containerId: result.container.containerId, cdpUrl: result.container.cdpUrl };
+  // v3-v: Create OUR context - cookies will be in THIS context
+  // This is the key fix: same connection owns context = cookies visible
+  console.log(`📦 Creating browser context (Solution F: single CDP owner)...`);
+  const context = await browser!.newContext();
+  const page = await context.newPage();
+  console.log(`✅ Browser instance ready with fresh context`);
+
+  return {
+    browser: browser!,
+    context,
+    page,
+    containerId: result.container.containerId,
+    cdpUrl: result.container.cdpUrl
+  };
 }
 
 async function releaseBrowserInstance(sessionId: string): Promise<void> {
@@ -158,35 +246,21 @@ async function releaseBrowserInstance(sessionId: string): Promise<void> {
   });
 }
 
-async function destroyBrowserInstance(sessionId: string): Promise<void> {
-  try {
-    const response = await fetch(`${BROWSER_MANAGER_URL}/destroy/${sessionId}`, {
-      method: 'POST'
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to destroy container: ${response.statusText}`);
-    }
-    console.log(`🗑️  Destroyed auth container for session ${sessionId.substring(0, 8)}...`);
-  } catch (error: any) {
-    console.error(`⚠️  Failed to destroy container for ${sessionId}:`, error.message);
-  }
-}
-
 /**
- * v19: Recycle browser instance - clear cookies/storage, refresh to QR page, return to pool
- * This replaces destroyBrowserInstance() for persistent containers
+ * v3-q: Destroy auth container after use (prevents state contamination)
+ * Browser-manager will destroy container and pool maintenance will create fresh ones
  */
-async function recycleBrowserInstance(sessionId: string): Promise<void> {
+async function destroyAuthContainer(sessionId: string): Promise<void> {
   try {
     const response = await fetch(`${BROWSER_MANAGER_URL}/recycle/${sessionId}`, {
       method: 'POST'
     });
     if (!response.ok) {
-      throw new Error(`Failed to recycle container: ${response.statusText}`);
+      throw new Error(`Failed to destroy container: ${response.statusText}`);
     }
-    console.log(`♻️  Recycled auth container for session ${sessionId.substring(0, 8)}...`);
+    console.log(`🗑️ Destroyed auth container for session ${sessionId.substring(0, 8)}...`);
   } catch (error: any) {
-    console.error(`⚠️  Failed to recycle container for ${sessionId}:`, error.message);
+    console.error(`⚠️ Failed to destroy container for ${sessionId}:`, error.message);
   }
 }
 
@@ -341,7 +415,7 @@ app.post('/upload-session', (req, res) => {
       status: 'uploaded'
     });
   } catch (error: any) {
-    console.error('Session upload error:', error);
+    console.error('Session upload error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -373,7 +447,7 @@ app.post('/load-session', (req, res) => {
       status: 'loaded'
     });
   } catch (error: any) {
-    console.error('Session load error:', error);
+    console.error('Session load error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -414,53 +488,86 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 
     // Start authentication flow asynchronously
     (async () => {
-      let browserInstance = null;
-      let authPage = null;
+      let browserInstance: BrowserInstance | null = null;
 
       try {
-        // Request browser container
+        // v3-v: Request browser container - NOW INCLUDES context/page creation
+        // This is the Solution F fix: single CDP connection owns everything
         browserInstance = await requestBrowserInstance(authSessionId);
-        authSessionManager.updateAuthSession(authSessionId, {
-          containerId: browserInstance.containerId
-        });
-
-        // Connect to browser
-        const contexts = browserInstance.browser.contexts();
-        const context = contexts[0] || await browserInstance.browser.newContext();
-
-        // Use existing page (pre-warmed and reloaded through proxy by browser-manager)
-        const pages = context.pages();  // Note: pages() returns Page[], not Promise
-        if (pages.length > 0) {
-          authPage = pages[0];
-          console.log(`♻️ Using existing pre-warmed page for auth ${authSessionId.substring(0, 8)}...`);
-        } else {
-          // Fallback: create new page if none exists
-          authPage = await context.newPage();
-          console.log(`📄 Created new page for auth ${authSessionId.substring(0, 8)}... (no pre-warmed page)`);
-        }
 
         authSessionManager.updateAuthSession(authSessionId, {
+          containerId: browserInstance.containerId,
           browser: browserInstance.browser,
-          page: authPage
+          page: browserInstance.page
         });
 
-        // Navigate to QR login page (skip if already there from pre-warm)
-        const currentUrl = authPage.url();
-        if (!currentUrl.includes('/login/qrcode')) {
-          console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
-          await authPage.goto('https://www.tiktok.com/login/qrcode', {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
+        const authPage = browserInstance.page;
+
+        // v3-v: Navigate to QR login page (moved from browser-manager)
+        // We always navigate since we created a fresh page
+        console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
+        await authPage.goto('https://www.tiktok.com/login/qrcode', {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+
+        // Wait for QR code with diagnostics on failure
+        try {
+          await authPage.waitForSelector('img[alt="qrcode"]', {
+            timeout: 10000,
+            state: 'visible'
           });
-        } else {
-          console.log(`✅ Page already on QR login for auth ${authSessionId.substring(0, 8)}...`);
+          console.log(`✅ QR code visible for auth ${authSessionId.substring(0, 8)}...`);
+        } catch (qrWaitError) {
+          // QR didn't appear - diagnose what's blocking
+          const currentUrl = authPage.url();
+          const pageState = await authPage.evaluate(() => {
+            const hasCaptcha = !!(
+              document.querySelector('#captcha_container') ||
+              document.querySelector('#verify-ele') ||
+              document.querySelector('#captcha-verify-image') ||
+              document.querySelector('.captcha_verify_img_slide') ||
+              document.querySelector('.secsdk-captcha-drag-icon')
+            );
+            const hasRecaptcha = !!document.querySelector('iframe[src*="recaptcha"]');
+            const bodyText = document.body?.innerText?.substring(0, 500) || '';
+            const title = document.title || '';
+
+            return { hasCaptcha, hasRecaptcha, bodyText, title };
+          });
+
+          const truncatedUrl = currentUrl.length > 100 ? currentUrl.substring(0, 100) + '...' : currentUrl;
+          const truncatedTitle = pageState.title.length > 80 ? pageState.title.substring(0, 80) + '...' : pageState.title;
+
+          console.error(`🚫 Auth ${authSessionId.substring(0, 8)} QR not visible after 10s`);
+          console.error(`   URL: ${truncatedUrl}`);
+          console.error(`   Title: ${truncatedTitle}`);
+
+          if (pageState.hasCaptcha) {
+            console.error(`   Blocker: [TIKTOK_CAPTCHA]`);
+          } else if (pageState.hasRecaptcha) {
+            console.error(`   Blocker: [RECAPTCHA]`);
+          } else {
+            console.error(`   Blocker: [UNKNOWN]`);
+          }
+          console.error(`   Body preview: ${pageState.bodyText.replace(/\n/g, ' ').substring(0, 200)}`);
+
+          // Capture screenshot before cleanup
+          await captureDebugScreenshot(authPage, authSessionId, 'qr_not_visible');
+
+          // Cleanup and fail
+          if (browserInstance) {
+            await destroyAuthContainer(authSessionId);
+          }
+          authSessionManager.updateAuthSession(authSessionId, { status: 'failed' });
+          return;
         }
 
-        // Extract and decode QR code (with sessionId for metrics tracking)
+        // Extract and decode QR code
         const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
         authSessionManager.updateAuthSession(authSessionId, {
           qrCodeData: qrData.image,
-          qrDecodedUrl: qrData.decodedUrl  // Store the magic link URL
+          qrDecodedUrl: qrData.decodedUrl
         });
 
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
@@ -472,7 +579,6 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
 
         // Start polling for login completion
-        // 🔥 NEW: Pass preAuthToken to enable TEE integration
         await waitForLoginCompletion(authSessionId, authPage, preAuthToken);
 
       } catch (error: any) {
@@ -484,7 +590,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // Release browser container
         if (browserInstance) {
           try {
-            await releaseBrowserInstance(authSessionId);
+            await destroyAuthContainer(authSessionId);
           } catch (releaseError) {
             console.error(`⚠️ Failed to release browser for ${authSessionId}`);
           }
@@ -499,7 +605,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
     });
 
   } catch (error: any) {
-    console.error('Auth start error:', error);
+    console.error('Auth start error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -508,16 +614,178 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
   const timeout = 120000; // 2 minutes
   const startTime = Date.now();
 
+  // v3-o: Track state for diagnostics
+  const seenUrls = new Set<string>();
+  const arrivedCookies = new Set<string>();
+  const requiredCookies = ['sessionid', 'msToken', 'ttwid', 'sid_guard', 'uid_tt', 'sid_tt'];
+  let lastHeartbeat = startTime;
+
   console.log(`⏳ Waiting for login completion for auth ${authSessionId.substring(0, 8)}...`);
+
+  // v3-p: Set up real-time page state detection via MutationObserver
+  let lastWarnings = new Set<string>();
+  let pageStateChanged = false;
+  let latestPageState: any = { hasQRCode: true };
+
+  // Expose function for browser to notify us of changes
+  await page.exposeFunction('onPageStateChange', (state: any) => {
+    latestPageState = state;
+    pageStateChanged = true;
+  }).catch(() => {}); // Ignore if already exposed
+
+  // Set up MutationObserver to detect changes immediately
+  await page.evaluate(() => {
+    const checkPageState = () => {
+      // Real TikTok CAPTCHA selectors (researched from tiktok-captcha-solver)
+      const hasCaptcha = !!(
+        document.querySelector('#captcha_container') ||
+        document.querySelector('#verify-ele') ||
+        document.querySelector('#captcha-verify-image') ||
+        document.querySelector('.captcha_verify_img_slide') ||
+        document.querySelector('.secsdk-captcha-drag-icon')
+      );
+
+      const hasRecaptcha = !!document.querySelector('iframe[src*="recaptcha"]');
+
+      // QR code presence (good sign if visible)
+      const hasQRCode = !!(
+        document.querySelector('canvas') ||
+        document.querySelector('[class*="qr"]') ||
+        document.querySelector('img[src*="qr"]')
+      );
+
+      // Error/expiry text detection
+      const bodyText = document.body?.innerText?.toLowerCase() || '';
+      const hasExpired = bodyText.includes('expired') || bodyText.includes('timed out') || bodyText.includes('scan again');
+      const hasError = bodyText.includes('something went wrong') || bodyText.includes('try again later');
+      const hasPhoneVerify = bodyText.includes('verify your phone') || bodyText.includes('verification code');
+
+      return { hasCaptcha, hasRecaptcha, hasQRCode, hasExpired, hasError, hasPhoneVerify };
+    };
+
+    // Initial state
+    (window as any).onPageStateChange(checkPageState());
+
+    // Watch for DOM changes
+    const observer = new MutationObserver(() => {
+      (window as any).onPageStateChange(checkPageState());
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+  }).catch(() => {});
 
   while (Date.now() - startTime < timeout) {
     try {
-      // PRIMARY: Check for sessionid cookie (fast - detects login immediately after mobile scan)
-      const cookies = await page.context().cookies();
-      const sessionIdCookie = cookies.find(c => c.name === 'sessionid');
+      // 1. Track URL changes (truncate query strings)
+      const fullUrl = page.url();
+      const baseUrl = fullUrl.split('?')[0].substring(0, 80);
+      if (!seenUrls.has(baseUrl)) {
+        seenUrls.add(baseUrl);
+        console.log(`📍 Auth ${authSessionId.substring(0, 8)} URL: ${baseUrl}`);
 
-      if (sessionIdCookie && sessionIdCookie.value && sessionIdCookie.value.length > 10) {
-        console.log(`✅ Login successful for auth ${authSessionId.substring(0, 8)}... (detected via sessionid cookie)`);
+        // v3-s: Capture on URL transition away from QR page with 0 cookies
+        // This is the "moment of silent rejection" - TikTok acknowledged scan but didn't auth
+        if (!baseUrl.includes('/login/qrcode') && arrivedCookies.size === 0) {
+          await captureDebugScreenshot(page, authSessionId, 'url_transition_no_cookies');
+        }
+      }
+
+      // 2. Early CAPTCHA detection - fail fast, don't wait 2 minutes
+      if (baseUrl.includes('google.com') || baseUrl.includes('captcha') || baseUrl.includes('recaptcha')) {
+        console.error(`🚫 Auth ${authSessionId.substring(0, 8)} CAPTCHA detected - aborting`);
+        authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
+        await destroyAuthContainer(authSessionId);
+        return;
+      }
+
+      // 3. Get ALL cookies - requiredCookies check handles filtering (v3-t)
+      const cookies = await page.context().cookies();
+      const cookieNames = cookies.map(c => c.name);
+
+      // 4. Progressive cookie logging - log each cookie as it arrives
+      for (const name of requiredCookies) {
+        if (cookieNames.includes(name) && !arrivedCookies.has(name)) {
+          arrivedCookies.add(name);
+          console.log(`🍪 Auth ${authSessionId.substring(0, 8)} cookie: ${name} (${arrivedCookies.size}/6)`);
+        }
+      }
+
+      // 5. Check for page state changes (real-time via MutationObserver)
+      if (pageStateChanged) {
+        pageStateChanged = false;
+
+        const currentWarnings = new Set<string>();
+        if (latestPageState.hasCaptcha) currentWarnings.add('TIKTOK_CAPTCHA');
+        if (latestPageState.hasRecaptcha) currentWarnings.add('RECAPTCHA');
+        if (latestPageState.hasExpired) currentWarnings.add('QR_EXPIRED');
+        if (latestPageState.hasError) currentWarnings.add('ERROR');
+        if (latestPageState.hasPhoneVerify) currentWarnings.add('PHONE_VERIFY');
+        if (!latestPageState.hasQRCode && arrivedCookies.size < 6) currentWarnings.add('QR_GONE');
+
+        // Log any NEW warnings immediately
+        for (const warning of currentWarnings) {
+          if (!lastWarnings.has(warning)) {
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            console.warn(`⚠️ Auth ${authSessionId.substring(0, 8)} [${warning}] at ${elapsed}s`);
+            console.warn(`   URL: ${baseUrl}`);
+
+            // v3-s: Capture screenshot on first warning occurrence
+            await captureDebugScreenshot(page, authSessionId, `warning_${warning.toLowerCase()}`);
+          }
+        }
+
+        // Log if warning CLEARED (state improved)
+        for (const warning of lastWarnings) {
+          if (!currentWarnings.has(warning)) {
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            console.log(`✓ Auth ${authSessionId.substring(0, 8)} [${warning}] cleared at ${elapsed}s`);
+          }
+        }
+
+        lastWarnings = currentWarnings;
+      }
+
+      // 6a. PRIMARY: URL-based login detection (v3-u, matches v2.4 behavior)
+      // If TikTok redirected away from login, user is authenticated
+      const fullUrlForDetection = page.url();
+      if (fullUrlForDetection.includes('/foryou') || fullUrlForDetection.includes('/home') ||
+          (fullUrlForDetection.includes('tiktok.com') && !fullUrlForDetection.includes('/login') && !fullUrlForDetection.includes('/qrcode'))) {
+        console.log(`✅ Auth ${authSessionId.substring(0, 8)} login detected via URL: ${fullUrlForDetection.substring(0, 60)}`);
+
+        // Extract session data
+        const sessionData = await extractAuthData(page);
+
+        authSessionManager!.updateAuthSession(authSessionId, {
+          status: 'complete',
+          sessionData
+        });
+
+        // TEE Integration: Encrypt and store via Xordi
+        if (preAuthToken && sessionData) {
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+        } else {
+          if (sessionManager && sessionData) {
+            const newSessionId = sessionManager.storeSession(sessionData);
+            console.log(`💾 Session stored locally: ${newSessionId.substring(0, 8)}...`);
+          }
+        }
+
+        try {
+          await destroyAuthContainer(authSessionId);
+        } catch (recycleError) {
+          console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
+        }
+
+        return;
+      }
+
+      // 6b. SECONDARY: Cookie-based detection (belt and suspenders)
+      if (arrivedCookies.size === 6) {
+        console.log(`✅ Auth ${authSessionId.substring(0, 8)} login successful (all 6 cookies)`);
 
         // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
@@ -540,7 +808,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 
         // v19: Recycle auth container (cleared and returned to pool for next user)
         try {
-          await recycleBrowserInstance(authSessionId);
+          await destroyAuthContainer(authSessionId);
         } catch (recycleError) {
           console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
         }
@@ -548,24 +816,44 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         return;
       }
 
-      // v3-n: Only trust sessionid cookie detection (matches v2.4)
-      // URL navigation detection removed - it triggered before cookies were set,
-      // causing extractAuthData failures and log spam
+      // 7. Heartbeat every 30 seconds - status update with diagnostics
+      if (Date.now() - lastHeartbeat > 30000) {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        const warningStr = lastWarnings.size > 0 ? ` [${[...lastWarnings].join(', ')}]` : '';
+        console.log(`💓 Auth ${authSessionId.substring(0, 8)} waiting... (${elapsed}s, ${arrivedCookies.size}/6 cookies, ${cookies.length} total)${warningStr}`);
+        console.log(`   URL: ${baseUrl}`);
+        lastHeartbeat = Date.now();
+      }
 
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-    } catch (error) {
-      // Continue waiting
+    } catch (error: any) {
+      // 7. Log errors instead of silent swallow
+      console.warn(`⚠️ Auth ${authSessionId.substring(0, 8)} poll error: ${error.message}`);
+
+      // v3-t: Break if browser died, delay on other errors
+      if (error.message.includes('closed')) break;
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
 
-  // Timeout
-  console.log(`⏰ Login timeout for auth ${authSessionId.substring(0, 8)}...`);
+  // 8. Timeout - diagnostics showing what we got
+  console.log(`⏰ Auth ${authSessionId.substring(0, 8)} timeout after 120s`);
+  console.log(`   URLs: ${[...seenUrls].join(' → ')}`);
+  console.log(`   Cookies: [${[...arrivedCookies].join(', ') || 'none'}] (${arrivedCookies.size}/6)`);
+  if (arrivedCookies.size < 6) {
+    const missing = requiredCookies.filter(name => !arrivedCookies.has(name));
+    console.log(`   Missing: [${missing.join(', ')}]`);
+  }
+
+  // v3-s: Capture screenshot at timeout to see final page state
+  await captureDebugScreenshot(page, authSessionId, 'timeout_no_cookies');
+
   authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
 
   // v19: Recycle timed-out auth container
   try {
-    await recycleBrowserInstance(authSessionId);
+    await destroyAuthContainer(authSessionId);
   } catch (recycleError) {
     console.error(`⚠️ Failed to recycle timed-out auth container for ${authSessionId}`);
   }
@@ -697,7 +985,7 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
     }
 
   } catch (error: any) {
-    console.error('Auth poll error:', error);
+    console.error('Auth poll error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -741,7 +1029,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
     }
 
   } catch (error: any) {
-    console.error(`❌ Sampling error for ${req.params.sessionId}:`, error);
+    console.error(`❌ Sampling error for ${req.params.sessionId}:`, error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -784,7 +1072,7 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
     }
 
   } catch (error: any) {
-    console.error(`❌ Sampling error for ${req.params.sessionId}:`, error);
+    console.error(`❌ Sampling error for ${req.params.sessionId}:`, error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -839,7 +1127,7 @@ app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
     res.json(result);
 
   } catch (error: any) {
-    console.error(`❌ Module sampling error for ${req.params.sessionId}:`, error);
+    console.error(`❌ Module sampling error for ${req.params.sessionId}:`, error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -884,7 +1172,7 @@ app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
     res.json(result);
 
   } catch (error: any) {
-    console.error(`❌ Module sampling error for ${req.params.sessionId}:`, error);
+    console.error(`❌ Module sampling error for ${req.params.sessionId}:`, error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -919,7 +1207,7 @@ app.post('/containers/create', async (req, res) => {
       status: data.container.status
     });
   } catch (error: any) {
-    console.error('Failed to create container:', error);
+    console.error('Failed to create container:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -938,7 +1226,7 @@ app.delete('/containers/:containerId', async (req, res) => {
 
     res.json({ success: true });
   } catch (error: any) {
-    console.error('Failed to delete container:', error);
+    console.error('Failed to delete container:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -959,7 +1247,7 @@ app.get('/containers', async (req, res) => {
       containers: []
     });
   } catch (error: any) {
-    console.error('Failed to get containers:', error);
+    console.error('Failed to get containers:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1287,13 +1575,13 @@ app.post('/api/tiktok/execute', async (req, res) => {
     if (isWebApi) {
       console.log(`📊 itemList length: ${(tiktokResponse.data?.itemList || []).length}`);
       if (!tiktokResponse.data?.itemList || tiktokResponse.data.itemList.length === 0) {
-        console.error(`⚠️ Empty response from TikTok. Full response:`, JSON.stringify(tiktokResponse.data));
+        console.error(`⚠️ Empty response from TikTok. Keys: ${Object.keys(tiktokResponse.data || {}).join(', ')}`);
       }
     }
     res.json(tiktokResponse.data);
 
   } catch (error: any) {
-    console.error('TikTok request execution failed:', error);
+    console.error('TikTok request execution failed:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1389,7 +1677,7 @@ app.post('/migrate/process-pending', async (req, res) => {
     });
 
   } catch (error: any) {
-    console.error('Migration processing failed:', error);
+    console.error('Migration processing failed:', error.message);
     res.status(500).json({
       error: error.message,
       processed_before_error: totalSuccess,
@@ -1401,6 +1689,25 @@ app.post('/migrate/process-pending', async (req, res) => {
 // ============================================================================
 
 const startTime = Date.now();
+
+// v3-s: Debug screenshot endpoint (no auth - security via random token)
+app.get('/debug/screenshot/:token', (req, res) => {
+  if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
+    return res.status(404).json({ error: 'Debug screenshots disabled' });
+  }
+
+  const { token } = req.params;
+  const screenshot = debugScreenshots.get(token);
+
+  if (!screenshot) {
+    return res.status(404).json({ error: 'Screenshot not found or expired' });
+  }
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Disposition',
+    `inline; filename="debug-${screenshot.authSessionId.substring(0, 8)}-${screenshot.reason}.png"`);
+  res.send(screenshot.buffer);
+});
 
 app.get('/health', (req, res) => {
   res.json({
