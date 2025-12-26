@@ -518,6 +518,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
             state: 'visible'
           });
           console.log(`✅ QR code visible for auth ${authSessionId.substring(0, 8)}...`);
+          // Capture screenshot when QR is visible (for debugging)
+          await captureDebugScreenshot(authPage, authSessionId, 'qr_visible');
         } catch (qrWaitError) {
           // QR didn't appear - diagnose what's blocking
           const currentUrl = authPage.url();
@@ -576,6 +578,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
         if (qrData.error) {
           console.log(`⚠️ QR extraction warning: ${qrData.error}`);
+          await captureDebugScreenshot(authPage, authSessionId, 'qr_extraction_error');
         }
 
         // Start polling for login completion
