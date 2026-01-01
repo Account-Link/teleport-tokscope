@@ -1,4 +1,6 @@
-import { execSync } from 'child_process';
+import { execSync, exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 // v3-v: Removed Playwright - browser-manager is Docker lifecycle only
 // tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
@@ -93,11 +95,11 @@ class BrowserManager {
       console.log(`🚀 Creating browser container: ${containerId}`);
 
       try {
-        execSync(`docker network inspect ${network}`, { stdio: 'ignore' });
+        await execAsync(`docker network inspect ${network}`);
       } catch {
         try {
           console.log(`📡 Creating network: ${network}`);
-          execSync(`docker network create --driver bridge --subnet ${subnet} ${network}`, { stdio: 'ignore' });
+          await execAsync(`docker network create --driver bridge --subnet ${subnet} ${network}`);
         } catch (error) {
           console.log(`⚠️  Network ${network} creation failed, assuming it exists`);
         }
@@ -134,14 +136,16 @@ class BrowserManager {
       // Add image name as final argument
       dockerCmd.push(process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest');
 
-      const result = execSync(dockerCmd.join(' '), { encoding: 'utf8' });
-      const shortContainerId = result.trim().substring(0, 12);
+      const { stdout: runResult } = await execAsync(dockerCmd.join(' '));
+      const result = runResult.trim();
+      const shortContainerId = result.substring(0, 12);
 
       console.log(`⏳ Waiting for container ${containerId} to be ready...`);
       let retries = 0;
       while (retries < 60) {
         try {
-          const containerStatus = execSync(`docker inspect --format='{{.State.Status}}' ${containerId}`, { encoding: 'utf8' }).trim();
+          const { stdout: statusOut } = await execAsync(`docker inspect --format='{{.State.Status}}' ${containerId}`);
+          const containerStatus = statusOut.trim();
           if (containerStatus !== 'running') {
             console.log(`Container ${containerId} status: ${containerStatus}`);
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -149,7 +153,7 @@ class BrowserManager {
             continue;
           }
 
-          execSync(`docker exec ${containerId} supervisorctl status neko`, { stdio: 'ignore' });
+          await execAsync(`docker exec ${containerId} supervisorctl status neko`);
           console.log(`📺 Container ${containerId} neko service is ready`);
           break;
         } catch {
@@ -163,7 +167,8 @@ class BrowserManager {
       }
 
       // Get the container's IP address from Docker
-      const containerIP = execSync(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`, { encoding: 'utf8' }).trim();
+      const { stdout: ipOut } = await execAsync(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`);
+      const containerIP = ipOut.trim();
       console.log(`📍 Container IP: ${containerIP}`);
 
       // v3-v: Wait for browser ready via HTTP (NO CDP connection)
@@ -185,6 +190,11 @@ class BrowserManager {
 
       console.log(`✅ Container ${containerId.substring(0, 16)}... ready (awaiting CDP from server.ts)`);
 
+      // z-1: Pre-configure proxy at creation time (not assignment)
+      // Proxy uses global credentials + random bucket - no per-session info needed
+      await this.configureContainerProxy(containerInfo);
+      console.log(`✅ Container ${containerId.substring(0, 16)}... proxy pre-configured`);
+
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
 
@@ -194,9 +204,7 @@ class BrowserManager {
     } catch (error: any) {
       console.error(`❌ Failed to create container ${containerId}:`, error.message);
 
-      try {
-        execSync(`docker rm -f ${containerId}`, { stdio: 'ignore' });
-      } catch {}
+      await execAsync(`docker rm -f ${containerId}`).catch(() => {});
 
       throw error;
     }
@@ -237,20 +245,9 @@ class BrowserManager {
 
     this.sessionToContainer.set(sessionId, containerId);
 
-    // JIT: Configure proxy now that container is being used for auth
-    try {
-      await this.configureContainerProxy(containerInfo);
-    } catch (proxyError: any) {
-      console.error(`❌ Failed to configure proxy: ${proxyError.message}`);
-      // Return container to pool since assignment failed
-      containerInfo.status = 'pooled';
-      this.containerPool.push(containerId);
-      this.sessionToContainer.delete(sessionId);
-      throw proxyError;
-    }
-
+    // z-1: Proxy already configured at creation time (instant assignment)
     // v3-v: NO navigation here - server.ts owns CDP and will navigate
-    console.log(`✅ Container ${containerId.substring(0, 16)}... assigned (proxy configured, awaiting CDP from server.ts)`);
+    console.log(`✅ Container ${containerId.substring(0, 16)}... assigned (pre-configured, awaiting CDP from server.ts)`);
 
     return containerInfo;
   }
@@ -373,7 +370,7 @@ class BrowserManager {
     // server.ts owns the connection and is responsible for cleanup
 
     try {
-      execSync(`docker rm -f ${containerId}`, { stdio: 'ignore' });
+      await execAsync(`docker rm -f ${containerId}`);
     } catch (error: any) {
       console.log(`⚠️  Failed to remove container ${containerId}: ${error.message}`);
     }
@@ -509,7 +506,7 @@ class BrowserManager {
     return this.containerPool.length;
   }
 
-  getStats(): { total: number; available: number; assigned: number; sessions: number } {
+  getStats(): { total: number; available: number; assigned: number; sessions: number; poolSize: number } {
     let available = 0;
     let assigned = 0;
 
@@ -522,7 +519,8 @@ class BrowserManager {
       total: this.containers.size,
       available,
       assigned,
-      sessions: this.sessionToContainer.size
+      sessions: this.sessionToContainer.size,
+      poolSize: this.containerPool.length  // z-1: Actual assignable containers
     };
   }
 }
