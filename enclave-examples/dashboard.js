@@ -227,6 +227,25 @@ app.get('/dashboard/activity', (req, res) => {
   res.json({ activities: activityLog });
 });
 
+// Sessions-only endpoint (no redundant /health call)
+app.get('/dashboard/sessions-only', (req, res) => {
+  try {
+    const sessionIds = Object.keys(sessions.sessions);
+    const sessionList = sessionIds.map(id => {
+      const s = sessions.sessions[id];
+      return {
+        id,
+        username: s.sessionData?.user?.username || 'unknown',
+        createdAt: s.createdAt,
+        lastUsed: s.lastUsed
+      };
+    });
+    res.json({ sessions: sessionList, count: sessionList.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Container management
 app.get('/dashboard/containers', async (req, res) => {
   const { status, data } = await enclaveRequest('/containers');
@@ -262,6 +281,45 @@ app.delete('/dashboard/containers/:containerId', async (req, res) => {
 app.get('/dashboard/health', async (req, res) => {
   const { status, data } = await enclaveRequest('/health');
   res.status(status).json(data);
+});
+
+// v3-w: Debug screenshots proxy endpoints
+app.get('/dashboard/debug/screenshots', async (req, res) => {
+  const apiKey = process.env.ENCLAVE_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'ENCLAVE_API_KEY not configured' });
+  }
+
+  const { status, data } = await enclaveRequest('/debug/screenshots', {
+    headers: { 'X-Api-Key': apiKey }
+  });
+  res.status(status).json(data);
+});
+
+app.get('/dashboard/debug/screenshot/:token', async (req, res) => {
+  const { token } = req.params;
+  const apiKey = process.env.ENCLAVE_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'ENCLAVE_API_KEY not configured' });
+  }
+
+  try {
+    const response = await fetch(`${ENCLAVE_URL}/debug/screenshot/${token}`, {
+      headers: { 'X-Api-Key': apiKey }
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Screenshot not found' });
+    }
+
+    res.setHeader('Content-Type', response.headers.get('Content-Type') || 'image/png');
+    res.setHeader('Content-Disposition', response.headers.get('Content-Disposition') || 'inline');
+
+    const buffer = await response.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Serve UI
@@ -344,6 +402,11 @@ app.get('/', (req, res) => {
     <div class="section">
       <h2>Recent Activity</h2>
       <div id="activityList">Loading...</div>
+    </div>
+
+    <div class="section" id="screenshotsSection" style="display:none">
+      <h2>Debug Screenshots</h2>
+      <div id="screenshotList">Loading...</div>
     </div>
   </div>
 
@@ -733,17 +796,135 @@ app.get('/', (req, res) => {
       }
     }
 
+    // Consolidated dashboard update - all fetches in parallel
+    async function updateDashboard() {
+      try {
+        const [health, sessions, containers, activity, screenshots] = await Promise.all([
+          fetch('/dashboard/health').then(r => r.json()).catch(() => null),
+          fetch('/dashboard/sessions-only').then(r => r.json()).catch(() => null),
+          fetch('/dashboard/containers').then(r => r.json()).catch(() => null),
+          fetch('/dashboard/activity').then(r => r.json()).catch(() => null),
+          fetch('/dashboard/debug/screenshots').then(r => r.json()).catch(() => ({ enabled: false }))
+        ]);
+        if (health) renderHealth(health);
+        if (sessions) renderSessions(sessions);
+        if (containers) renderContainers(containers);
+        if (activity) renderActivity(activity);
+        if (screenshots) renderScreenshots(screenshots);
+      } catch (err) {
+        console.error('Dashboard update failed:', err);
+      }
+    }
+
+    // Render functions that extract data from responses
+    function renderHealth(data) {
+      if (data.enclave) {
+        document.getElementById('enclaveStatus').innerHTML = \`
+          <strong>Status:</strong> \${data.enclave.healthy ? '✅ Healthy' : '❌ Unhealthy'}<br>
+          <strong>Sessions:</strong> \${data.enclave.sessions || 0}<br>
+          <strong>Containers:</strong> \${data.enclave.containers?.available || 0} available / \${data.enclave.containers?.total || 0} total
+        \`;
+      }
+    }
+
+    function renderSessions(data) {
+      const list = document.getElementById('sessionList');
+      if (!data.sessions || data.sessions.length === 0) {
+        list.innerHTML = '<p style="color:#6b7280">No active sessions</p>';
+        return;
+      }
+      list.innerHTML = data.sessions.map(s => \`
+        <div class="session-card">
+          <div class="session-header">
+            <div class="session-info">
+              <div class="session-title">@\${s.username}</div>
+              <div class="session-meta">ID: \${s.id.substring(0, 8)}...</div>
+            </div>
+          </div>
+        </div>
+      \`).join('');
+    }
+
+    function renderContainers(data) {
+      const list = document.getElementById('containerList');
+      if (!data.containers || data.containers.length === 0) {
+        list.innerHTML = '<p style="color:#6b7280">No containers</p>';
+        return;
+      }
+      list.innerHTML = data.containers.map(c => \`
+        <div class="session-card">
+          <div class="session-header">
+            <div class="session-info">
+              <div class="session-title">\${c.id.substring(0, 12)}...</div>
+              <div class="session-meta">\${c.status}</div>
+            </div>
+            <div class="session-actions">
+              <button class="danger" onclick="deleteContainer('\${c.id}')">Delete</button>
+            </div>
+          </div>
+        </div>
+      \`).join('');
+    }
+
+    function renderActivity(data) {
+      const list = document.getElementById('activityList');
+      if (!data.activities || data.activities.length === 0) {
+        list.innerHTML = '<p style="color:#6b7280">No recent activity</p>';
+        return;
+      }
+      list.innerHTML = data.activities.slice(0, 10).map(a => \`
+        <div style="padding:8px 0;border-bottom:1px solid #374151">
+          <div style="font-size:12px;color:#9ca3af">\${new Date(a.timestamp).toLocaleTimeString()}</div>
+          <div>\${a.message}</div>
+        </div>
+      \`).join('');
+    }
+
+    function renderScreenshots(data) {
+      const section = document.getElementById('screenshotsSection');
+      const list = document.getElementById('screenshotList');
+
+      if (!data.enabled) {
+        section.style.display = 'none';
+        return;
+      }
+
+      section.style.display = 'block';
+
+      if (!data.screenshots || data.screenshots.length === 0) {
+        list.innerHTML = '<p style="color:#6b7280">No active screenshots (TTL: ' + Math.round(data.ttlMs / 60000) + ' min)</p>';
+        return;
+      }
+
+      list.innerHTML = data.screenshots.map(ss => {
+        const ageMin = Math.round(ss.ageMs / 60000);
+        const expiresMin = Math.round(ss.expiresInMs / 60000);
+        return \`
+          <div class="session-card">
+            <div class="session-header">
+              <div class="session-info">
+                <div class="session-title">\${ss.reason}</div>
+                <div class="session-meta">Auth: \${ss.authSessionId.substring(0, 8)}...</div>
+                <div class="session-meta">Page: \${ss.pageTitle || ss.pageUrl}</div>
+                <div class="session-meta">Age: \${ageMin}m | Expires: \${expiresMin}m</div>
+              </div>
+              <div class="session-actions">
+                <a href="/dashboard/debug/screenshot/\${ss.token}" target="_blank">
+                  <button class="secondary">View</button>
+                </a>
+              </div>
+            </div>
+          </div>
+        \`;
+      }).join('');
+    }
+
     // Initialize
     checkModuleAvailability();
-    updateHealth();
-    updateSessions();
-    updateContainers();
-    updateActivity();
+    updateDashboard();
 
-    setInterval(updateHealth, 10000);
-    setInterval(updateSessions, 30000);
-    setInterval(updateContainers, 30000);
-    setInterval(updateActivity, 15000);
+    // Single consolidated poll every 15 seconds
+    setInterval(updateDashboard, 15000);
   </script>
 </body>
 </html>`);

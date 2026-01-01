@@ -1693,10 +1693,17 @@ app.post('/migrate/process-pending', async (req, res) => {
 
 const startTime = Date.now();
 
-// v3-s: Debug screenshot endpoint (no auth - security via random token)
+// v3-s: Debug screenshot endpoint (with API key auth)
 app.get('/debug/screenshot/:token', (req, res) => {
   if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
     return res.status(404).json({ error: 'Debug screenshots disabled' });
+  }
+
+  // Require API key auth
+  const apiKey = req.header('X-Api-Key');
+  const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+  if (!apiKey || !allowedKeys.includes(apiKey)) {
+    return res.status(401).json({ error: 'Invalid API key' });
   }
 
   const { token } = req.params;
@@ -1710,6 +1717,42 @@ app.get('/debug/screenshot/:token', (req, res) => {
   res.setHeader('Content-Disposition',
     `inline; filename="debug-${screenshot.authSessionId.substring(0, 8)}-${screenshot.reason}.png"`);
   res.send(screenshot.buffer);
+});
+
+// v3-w: List all active debug screenshots
+app.get('/debug/screenshots', (req, res) => {
+  if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
+    return res.json({ enabled: false, count: 0, screenshots: [] });
+  }
+
+  // Require API key auth
+  const apiKey = req.header('X-Api-Key');
+  const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+  if (!apiKey || !allowedKeys.includes(apiKey)) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
+
+  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
+  const now = Date.now();
+
+  const screenshots = Array.from(debugScreenshots.entries()).map(([token, ss]) => ({
+    token,
+    url: `${baseUrl}/debug/screenshot/${token}`,
+    authSessionId: ss.authSessionId,
+    reason: ss.reason,
+    pageUrl: ss.url,
+    pageTitle: ss.title,
+    timestamp: new Date(ss.timestamp).toISOString(),
+    ageMs: now - ss.timestamp,
+    expiresInMs: DEBUG_SCREENSHOT_TTL_MS - (now - ss.timestamp)
+  }));
+
+  res.json({
+    enabled: true,
+    ttlMs: DEBUG_SCREENSHOT_TTL_MS,
+    count: screenshots.length,
+    screenshots
+  });
 });
 
 app.get('/health', (req, res) => {
