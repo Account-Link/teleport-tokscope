@@ -15,6 +15,18 @@ const QRExtractor = require('./lib/qr-extractor');
 const xordiSecurityModule = require('./xordi-security-module');
 const teeCrypto = require('./tee-crypto');
 
+// Issue 7a: Prevent crashes from unhandled promise rejections
+process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
+  console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason?.message || reason);
+  // Don't exit - let the process continue serving other requests
+});
+
+process.on('uncaughtException', (error: Error) => {
+  console.error('🚨 Uncaught Exception:', error.message);
+  console.error(error.stack);
+  // Don't exit for recoverable errors
+});
+
 const BROWSER_MANAGER_URL = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
 
 interface SessionData {
@@ -227,14 +239,25 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
   // v3-v: Create OUR context - cookies will be in THIS context
   // This is the key fix: same connection owns context = cookies visible
   console.log(`📦 Creating browser context (Solution F: single CDP owner)...`);
-  const context = await browser!.newContext();
-  const page = await context.newPage();
+
+  // Issue 7b: Wrap browser operations in try-catch for TargetClosedError
+  let context, page;
+  try {
+    context = await browser!.newContext();
+    page = await context.newPage();
+  } catch (error: any) {
+    if (error.name === 'TargetClosedError' || error.message?.includes('Target closed')) {
+      console.error(`⚠️ Browser closed during context creation for ${sessionId}`);
+      throw new Error('BROWSER_DISCONNECTED');
+    }
+    throw error;
+  }
   console.log(`✅ Browser instance ready with fresh context`);
 
   return {
     browser: browser!,
-    context,
-    page,
+    context: context!,
+    page: page!,
     containerId: result.container.containerId,
     cdpUrl: result.container.cdpUrl
   };
@@ -912,25 +935,31 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
     // Phase 3: Escalate trust level after verification
     console.log('🔼 Escalating trust level...');
 
-    const escalateResponse = await axios.post(
-      `${xordiApiUrl}/api/enclave/escalate-trust`,
-      {
-        sec_user_id: secUserId,
-        pre_auth_token: preAuthToken,
-        tokscope_session_id: authSessionId
-      },
-      {
-        headers: {
-          'X-Api-Key': xordiApiKey,
-          'Content-Type': 'application/json'
+    // Issue 6: Wrap escalate-trust in separate try-catch (don't re-throw)
+    try {
+      const escalateResponse = await axios.post(
+        `${xordiApiUrl}/api/enclave/escalate-trust`,
+        {
+          sec_user_id: secUserId,
+          pre_auth_token: preAuthToken,
+          tokscope_session_id: authSessionId
+        },
+        {
+          headers: {
+            'X-Api-Key': xordiApiKey,
+            'Content-Type': 'application/json'
+          }
         }
-      }
-    );
+      );
 
-    if (!escalateResponse.data.success) {
-      console.warn('⚠️ Trust escalation failed, user remains at trust_level=0');
-    } else {
-      console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
+      if (!escalateResponse.data.success) {
+        console.warn('⚠️ Trust escalation failed, user remains at trust_level=0');
+      } else {
+        console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
+      }
+    } catch (escalateError: any) {
+      // DON'T throw - user is already stored, escalation failure is non-fatal
+      console.warn(`⚠️ Trust escalation error (user stored OK): ${escalateError.message}`);
     }
 
     // Store in local session manager for immediate use
