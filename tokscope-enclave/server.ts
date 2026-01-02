@@ -75,13 +75,14 @@ interface DebugScreenshot {
   buffer: Buffer;
   timestamp: number;
   authSessionId: string;
-  reason: string;
+  reason: string;  // 'qr_visible' | 'url_change' | 'timeout' | 'success'
   url: string;
   title: string;
+  step: number;    // 1, 2, 3... for ordering within session
 }
 
 const debugScreenshots = new Map<string, DebugScreenshot>();
-const DEBUG_SCREENSHOT_TTL_MS = parseInt(process.env.DEBUG_SCREENSHOT_TTL_MS || '600000'); // 10 min default
+const DEBUG_SCREENSHOT_TTL_MS = parseInt(process.env.DEBUG_SCREENSHOT_TTL_MS || '300000'); // 5 min default
 
 // Cleanup expired screenshots every minute
 setInterval(() => {
@@ -93,6 +94,9 @@ setInterval(() => {
     }
   }
 }, 60000);
+
+// z-4: Track step counter per auth session
+const authScreenshotSteps = new Map<string, number>();
 
 /**
  * v3-s: Capture debug screenshot and return access URL
@@ -113,13 +117,18 @@ async function captureDebugScreenshot(
     const url = page.url();
     const title = await page.title();
 
+    // z-4: Increment step counter for this auth session
+    const currentStep = (authScreenshotSteps.get(authSessionId) || 0) + 1;
+    authScreenshotSteps.set(authSessionId, currentStep);
+
     debugScreenshots.set(token, {
       buffer,
       timestamp: Date.now(),
       authSessionId,
       reason,
       url,
-      title
+      title,
+      step: currentStep
     });
 
     // Log clickable URL (appears in docker logs)
@@ -253,6 +262,74 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     throw error;
   }
   console.log(`✅ Browser instance ready with fresh context`);
+
+  // z-4 Phase 2b: Verify relay is configured
+  try {
+    const relayStatus = await fetch(`http://${result.container.ip}:1081/status`);
+    const status = await relayStatus.json();
+    if (status.mode === 'proxied') {
+      console.log(`✅ [relay] configured → ${status.upstream}`);
+    } else {
+      console.log(`⚠️ [relay] NOT configured (mode: ${status.mode})`);
+    }
+  } catch (e) {
+    console.log(`⚠️ [relay] status check failed`);
+  }
+
+  // z-4 Phase 2a: Log failed network requests
+  page.on('requestfailed', request => {
+    const url = request.url();
+    const failure = request.failure();
+    if (url.includes('tiktok.com')) {
+      console.log(`❌ [network] ${url.substring(0, 80)}... - ${failure?.errorText || 'unknown'}`);
+    }
+  });
+
+  // z-4 Phase 2c: Log QR polling requests only
+  page.on('request', request => {
+    const url = request.url();
+    if (url.includes('qrcode') || url.includes('check_qr') || url.includes('scan_status')) {
+      console.log(`🔄 [qr-poll] ${request.method()} ${url.substring(0, 60)}...`);
+    }
+  });
+  page.on('response', response => {
+    const url = response.url();
+    if (url.includes('qrcode') || url.includes('check_qr') || url.includes('scan_status')) {
+      console.log(`📥 [qr-poll] ${response.status()} ${url.substring(0, 60)}...`);
+    }
+  });
+
+  // z-4 Phase 2d: Log URL changes (domain + path only)
+  page.on('framenavigated', frame => {
+    if (frame === page.mainFrame()) {
+      try {
+        const parsed = new URL(frame.url());
+        console.log(`🔀 [url] ${parsed.hostname}${parsed.pathname}`);
+      } catch (e) { /* ignore invalid URLs */ }
+    }
+  });
+
+  // z-4 Phase 2e: Log when auth cookies are set via Set-Cookie header
+  // Use headersArray() to handle multiple Set-Cookie headers correctly
+  const AUTH_COOKIES = ['sessionid', 'sid_guard', 'uid_tt', 'sid_tt'];
+  const seenCookies = new Set<string>();
+  page.on('response', async response => {
+    try {
+      const headers = await response.headersArray();
+      const setCookies = headers
+        .filter(h => h.name.toLowerCase() === 'set-cookie')
+        .map(h => h.value);
+
+      for (const cookieStr of setCookies) {
+        for (const cookieName of AUTH_COOKIES) {
+          if (cookieStr.startsWith(`${cookieName}=`) && !seenCookies.has(cookieName)) {
+            seenCookies.add(cookieName);
+            console.log(`🍪 [+cookie] ${cookieName}`);
+          }
+        }
+      }
+    } catch (e) { /* response may be closed */ }
+  });
 
   return {
     browser: browser!,
@@ -1372,10 +1449,8 @@ app.post('/api/tiktok/execute', async (req, res) => {
     if (localSession && localSession.cookies) {
       sessionData = localSession;
       cookies = localSession.cookies;
-      console.log(`📦 Using local session for ${sec_user_id.substring(0, 8)}...`);
     } else {
       // Retrieve TEE-encrypted cookies from Xordi DB
-      console.log(`🔍 Retrieving TEE-encrypted cookies from Xordi for ${sec_user_id.substring(0, 8)}...`);
 
       const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
       const xordiApiKey = process.env.XORDI_API_KEY;
@@ -1399,7 +1474,6 @@ app.post('/api/tiktok/execute', async (req, res) => {
         }
 
         // Decrypt cookies IN TEE
-        console.log(`🔓 Decrypting cookies in TEE...`);
         const encryptedHex = cookiesResponse.data.tee_encrypted_cookies;
         cookies = teeCrypto.decryptCookies(encryptedHex);
 
@@ -1414,8 +1488,6 @@ app.post('/api/tiktok/execute', async (req, res) => {
             sec_user_id
           }
         };
-
-        console.log(`✅ Cookies decrypted successfully (${cookies.length} cookies)`);
 
       } catch (error: any) {
         console.error('Failed to retrieve/decrypt cookies:', error.message);
@@ -1438,10 +1510,9 @@ app.post('/api/tiktok/execute', async (req, res) => {
           const oldMsToken = url.searchParams.get('msToken');
           url.searchParams.set('msToken', freshMsToken);
           request.endpoint = url.pathname + url.search;
-          console.log(`🔄 Replaced msToken in URL with fresh value from cookies`);
         }
       } catch (urlError) {
-        console.log(`⚠️ Could not parse endpoint as URL, skipping msToken injection`);
+        // Could not parse endpoint as URL, skipping msToken injection
       }
     }
 
@@ -1449,15 +1520,12 @@ app.post('/api/tiktok/execute', async (req, res) => {
     const apiType = request.apiType || 'mobile';
     const isWebApi = apiType === 'web';
 
-    console.log(`🌐 API Type: ${apiType}`);
-
     // 5. Extract cookies - different filtering for web vs mobile
     let cookieString = '';
     if (cookies && Array.isArray(cookies)) {
       if (isWebApi) {
         // Web API: Use all cookies
         cookieString = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
-        console.log(`🍪 Using ${cookies.length} web cookies`);
       } else {
         // Mobile API: Filter to mobile-only cookies
         const mobileCookieNames = [
@@ -1474,7 +1542,6 @@ app.post('/api/tiktok/execute', async (req, res) => {
         ];
         const filteredCookies = cookies.filter((c: any) => mobileCookieNames.includes(c.name));
         cookieString = filteredCookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
-        console.log(`🍪 Filtered ${cookies.length} cookies → ${filteredCookies.length} mobile cookies`);
       }
     }
 
@@ -1551,8 +1618,6 @@ app.post('/api/tiktok/execute', async (req, res) => {
       const socksProxy = `socks5://${ipfoxyUser}:${password}@${gateway}`;
       proxyAgent = new SocksProxyAgent(socksProxy);
 
-      console.log(`🌐 Routing through IPFoxy (session: ${ipfoxy_session.substring(0, 8)}...) for user ${sec_user_id.substring(0, 16)}...`);
-
     } else if (proxyMode === 'wireguard' && wireguard_bucket !== null && wireguard_bucket !== undefined) {
       // WireGuard buckets run on borgcube, connect via external SOCKS5
       const wgHost = process.env.WIREGUARD_HOST || '162.251.235.136';
@@ -1569,10 +1634,8 @@ app.post('/api/tiktok/execute', async (req, res) => {
       const socksProxy = `socks5://${wgUser}:${wgPass}@${wgHost}:${port}`;
       proxyAgent = new SocksProxyAgent(socksProxy);
 
-      console.log(`🌐 [wireguard] bucket ${wireguard_bucket} → ${wgHost}:${port}`);
-
     } else {
-      console.log(`🌐 Using direct connection (no proxy configured)`);
+      // Direct connection (no proxy)
     }
 
     // For web API, endpoint already has query string; for mobile API, use params
@@ -1595,22 +1658,9 @@ app.post('/api/tiktok/execute', async (req, res) => {
       axiosConfig.params = request.params;
     }
 
-    // DEBUG: Log the exact request being made
-    console.log(`📤 REQUEST URL: ${axiosConfig.url}`);
-    console.log(`📤 REQUEST HEADERS:`, JSON.stringify(Object.keys(requestHeaders)));
-    console.log(`📤 COOKIE NAMES: ${cookies.map((c: any) => c.name).join(', ')}`);
-
     const tiktokResponse = await axios.request(axiosConfig);
 
     // 8. Return response (public video metadata)
-    console.log(`✅ TikTok response status: ${tiktokResponse.status}`);
-    console.log(`📦 Response keys: ${Object.keys(tiktokResponse.data || {}).join(', ')}`);
-    if (isWebApi) {
-      console.log(`📊 itemList length: ${(tiktokResponse.data?.itemList || []).length}`);
-      if (!tiktokResponse.data?.itemList || tiktokResponse.data.itemList.length === 0) {
-        console.error(`⚠️ Empty response from TikTok. Keys: ${Object.keys(tiktokResponse.data || {}).join(', ')}`);
-      }
-    }
     res.json(tiktokResponse.data);
 
   } catch (error: any) {
@@ -1769,6 +1819,7 @@ app.get('/debug/screenshots', (req, res) => {
     token,
     url: `${baseUrl}/debug/screenshot/${token}`,
     authSessionId: ss.authSessionId,
+    step: ss.step,
     reason: ss.reason,
     pageUrl: ss.url,
     pageTitle: ss.title,
@@ -1783,6 +1834,32 @@ app.get('/debug/screenshots', (req, res) => {
     count: screenshots.length,
     screenshots
   });
+});
+
+// z-4: Get all screenshots for a specific auth session
+app.get('/debug/screenshots/:authSessionId', (req, res) => {
+  const apiKey = req.headers['x-api-key'] as string;
+  const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+  if (!apiKey || !allowedKeys.includes(apiKey)) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
+
+  const { authSessionId } = req.params;
+  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
+
+  const screenshots = Array.from(debugScreenshots.entries())
+    .filter(([_, ss]) => ss.authSessionId === authSessionId)
+    .sort((a, b) => a[1].step - b[1].step)
+    .map(([token, ss]) => ({
+      token,
+      url: `${baseUrl}/debug/screenshot/${token}`,
+      step: ss.step,
+      reason: ss.reason,
+      pageUrl: `${new URL(ss.url).hostname}${new URL(ss.url).pathname}`,
+      timestamp: new Date(ss.timestamp).toISOString()
+    }));
+
+  res.json({ authSessionId, count: screenshots.length, screenshots });
 });
 
 app.get('/health', (req, res) => {
