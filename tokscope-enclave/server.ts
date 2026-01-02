@@ -285,19 +285,8 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     }
   });
 
-  // z-4 Phase 2c: Log QR polling requests only
-  page.on('request', request => {
-    const url = request.url();
-    if (url.includes('qrcode') || url.includes('check_qr') || url.includes('scan_status')) {
-      console.log(`🔄 [qr-poll] ${request.method()} ${url.substring(0, 60)}...`);
-    }
-  });
-  page.on('response', response => {
-    const url = response.url();
-    if (url.includes('qrcode') || url.includes('check_qr') || url.includes('scan_status')) {
-      console.log(`📥 [qr-poll] ${response.status()} ${url.substring(0, 60)}...`);
-    }
-  });
+  // z-5a: Removed QR poll status logging (was causing screenshot spam)
+  // Detection reverted to v2.4 style: URL-based + sessionid cookie
 
   // z-4 Phase 2d: Log URL changes (domain + path only)
   page.on('framenavigated', frame => {
@@ -614,7 +603,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // Wait for QR code with diagnostics on failure
         try {
           await authPage.waitForSelector('img[alt="qrcode"]', {
-            timeout: 10000,
+            timeout: 15000,  // z-5a: increased from 10s to 15s
             state: 'visible'
           });
           console.log(`✅ QR code visible for auth ${authSessionId.substring(0, 8)}...`);
@@ -886,9 +875,9 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         return;
       }
 
-      // 6b. SECONDARY: Cookie-based detection (belt and suspenders)
-      if (arrivedCookies.size === 6) {
-        console.log(`✅ Auth ${authSessionId.substring(0, 8)} login successful (all 6 cookies)`);
+      // 6b. SECONDARY: Cookie-based detection (sessionid sufficient, like Nov 13 version)
+      if (arrivedCookies.has('sessionid')) {
+        console.log(`✅ Auth ${authSessionId.substring(0, 8)} login successful (sessionid cookie detected)`);
 
         // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
@@ -928,7 +917,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         lastHeartbeat = Date.now();
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 3000));  // z-5a: reduced polling frequency
 
     } catch (error: any) {
       // 7. Log errors instead of silent swallow
