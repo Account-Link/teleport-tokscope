@@ -1276,6 +1276,7 @@ app.get('/containers', async (req, res) => {
       total: stats.total,
       available: stats.available,
       assigned: stats.assigned,
+      poolSize: stats.poolSize,  // z-1: Pass through poolSize for borgcube
       containers: []
     });
   } catch (error: any) {
