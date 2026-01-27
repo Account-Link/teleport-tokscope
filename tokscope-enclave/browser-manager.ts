@@ -121,6 +121,9 @@ class BrowserManager {
       // Resource limits (configurable via env vars)
       // NOTE: CPU limits disabled - Phala Docker-in-Docker doesn't support CPU tuning
       // Tested: --cpus flag (fails), --cpuset-cpus pinning (no performance gain)
+      if (process.env.BROWSER_CPUSET_CPUS) {
+        dockerCmd.push("--cpuset-cpus", process.env.BROWSER_CPUSET_CPUS);
+      }
       if (process.env.BROWSER_MEMORY_LIMIT) {
         dockerCmd.push('--memory', process.env.BROWSER_MEMORY_LIMIT);
       }
@@ -271,7 +274,8 @@ class BrowserManager {
       }
 
       // Random bucket for QR auth (no sec_user_id yet - will be assigned deterministically after login)
-      const bucket = Math.floor(Math.random() * 10);
+      const bucketCount = parseInt(process.env.WIREGUARD_BUCKET_COUNT || '10');
+      const bucket = Math.floor(Math.random() * bucketCount);
       const port = wgBasePort + bucket;
 
       configPayload = JSON.stringify({
