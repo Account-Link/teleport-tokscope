@@ -119,14 +119,30 @@ class BrowserManager {
       ];
 
       // Resource limits (configurable via env vars)
-      // NOTE: CPU limits disabled - Phala Docker-in-Docker doesn't support CPU tuning
-      // Tested: --cpus flag (fails), --cpuset-cpus pinning (no performance gain)
+      // CPU: for non-Phala / self-hosted environments we allow BROWSER_CPU_LIMIT
+      // to cap the number of CPUs via Docker's --cpus flag. On environments where
+      // CPU tuning is not supported (e.g. Phala Docker-in-Docker), simply omit
+      // BROWSER_CPU_LIMIT and no CPU limits will be applied.
+      const isPhala = !!process.env.PHALA_ENV;
+      const cpuLimitStr = !isPhala ? process.env.BROWSER_CPU_LIMIT : undefined;
+      if (!isPhala && cpuLimitStr) {
+        const limit = parseFloat(cpuLimitStr);
+        if (Number.isFinite(limit) && limit > 0) {
+          dockerCmd.push('--cpus', limit.toString());
+          console.log(`📊 Applying CPU limit for ${containerId}: --cpus=${limit}`);
+        } else {
+          console.log(`⚠️ Invalid BROWSER_CPU_LIMIT='${cpuLimitStr}', skipping CPU limit`);
+        }
+      }
+
+
       if (process.env.BROWSER_MEMORY_LIMIT) {
         dockerCmd.push('--memory', process.env.BROWSER_MEMORY_LIMIT);
       }
       if (process.env.BROWSER_MEMORY_RESERVATION) {
         dockerCmd.push('--memory-reservation', process.env.BROWSER_MEMORY_RESERVATION);
       }
+
 
       // Proxy is configured JIT when container is assigned for auth
       // Browser uses local relay at 127.0.0.1:1080 (hardcoded in chromium.conf)
