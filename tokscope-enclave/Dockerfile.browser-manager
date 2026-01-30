@@ -59,7 +59,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
 # Step 1: System packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    docker.io=20.10.24+dfsg1-1+deb12u1+b2 \
+    docker.io=20.10.24+dfsg1-1+deb12u1+b3 \
     curl=7.88.1-10+deb12u14 \
     ca-certificates=20230311+deb12u1 && \
     apt-get clean && \

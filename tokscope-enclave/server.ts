@@ -436,17 +436,27 @@ let moduleLoader: any = null;
 
 async function initDStack(): Promise<void> {
   try {
-    const { DstackSDK } = require('@phala/dstack-sdk');
-    dstackSDK = new DstackSDK('/var/run/dstack.sock');
-    await dstackSDK.connect();
+    const { DstackClient } = require('@phala/dstack-sdk');
+    const client = new DstackClient();
 
-    const keyResult = await dstackSDK.deriveKey('session-encryption', 'aes');
-    encryptionKey = Buffer.from(keyResult.key.replace('0x', ''), 'hex').slice(0, 32);
-    console.log('✅ DStack initialized, using TEE-derived encryption key');
+    // Session encryption key
+    const sessionKeyResult = await client.getKey('session-encryption', 'aes');
+    encryptionKey = Buffer.from(sessionKeyResult.key).slice(0, 32);
+
+    // Cookie encryption key (separate derivation path = separate key)
+    const cookieKeyResult = await client.getKey('cookie-encryption', 'aes');
+    const cookieKey = Buffer.from(cookieKeyResult.key).slice(0, 32);
+    teeCrypto.setDStackKey(cookieKey);
+
+    // Keep reference for /health endpoint
+    dstackSDK = client;
+
+    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies');
   } catch (error: any) {
-    console.log('⚠️ DStack unavailable, using fallback encryption key:', error.message);
+    console.log('⚠️ DStack unavailable, using fallback encryption keys:', error.message);
     const seed = 'tcb-session-encryption-fallback-seed-12345';
     encryptionKey = crypto.createHash('sha256').update(seed).digest();
+    // tee-crypto.js keeps its constructor fallback key
   }
 }
 
@@ -966,6 +976,12 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
 
     console.log('🔐 Encrypting cookies with TEE key...');
 
+    // Guard: If DStack socket exists (production Phala CVM) but DStack failed to init, refuse to encrypt
+    const dstackSocketExists = fs.existsSync('/var/run/dstack.sock');
+    if (dstackSocketExists && !teeCrypto.isDStackKey()) {
+      throw new Error('DStack socket present but key not initialized — refusing to encrypt with fallback key');
+    }
+
     // Phase 2a: Encrypt cookies IN TEE (plaintext only exists in TEE memory)
     const teeEncryptedCookies = teeCrypto.encryptCookies(sessionData.cookies);
 
@@ -999,7 +1015,13 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
     console.log(`✅ User stored in Xordi: ${secUserId} (trust_level=0, encrypted cookies)`);
 
     // Phase 3: Escalate trust level after verification
-    console.log('🔼 Escalating trust level...');
+    // In staging mode, skip trust_level update but still complete the auth flow (update qr_sessions, etc.)
+    const isStaging = process.env.DEPLOY_ENV === 'staging';
+    if (isStaging) {
+      console.log('🔼 Completing auth flow (staging mode - skip trust escalation)...');
+    } else {
+      console.log('🔼 Escalating trust level...');
+    }
 
     // Issue 6: Wrap escalate-trust in separate try-catch (don't re-throw)
     try {
@@ -1008,7 +1030,8 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
         {
           sec_user_id: secUserId,
           pre_auth_token: preAuthToken,
-          tokscope_session_id: authSessionId
+          tokscope_session_id: authSessionId,
+          skip_trust_update: isStaging  // Staging: complete flow without trust escalation
         },
         {
           headers: {
@@ -1021,7 +1044,11 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
       if (!escalateResponse.data.success) {
         console.warn('⚠️ Trust escalation failed, user remains at trust_level=0');
       } else {
-        console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
+        if (isStaging) {
+          console.log(`✅ Auth flow completed (staging): ${secUserId} (trust_level=0)`);
+        } else {
+          console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
+        }
       }
     } catch (escalateError: any) {
       // DON'T throw - user is already stored, escalation failure is non-fatal
@@ -1462,9 +1489,9 @@ app.post('/api/tiktok/execute', async (req, res) => {
           throw new Error('Failed to retrieve encrypted cookies from Xordi');
         }
 
-        // Decrypt cookies IN TEE
+        // Decrypt cookies IN TEE (fallback handles pre-migration cookies)
         const encryptedHex = cookiesResponse.data.tee_encrypted_cookies;
-        cookies = teeCrypto.decryptCookies(encryptedHex);
+        cookies = teeCrypto.decryptCookiesWithFallback(encryptedHex);
 
         // Build session data structure
         sessionData = {
@@ -1688,6 +1715,12 @@ app.post('/migrate/process-pending', async (req, res) => {
     return res.status(500).json({ error: 'XORDI_API_KEY not configured' });
   }
 
+  // Guard: If DStack socket exists but DStack failed to init, refuse to encrypt
+  const dstackSocketExists = fs.existsSync('/var/run/dstack.sock');
+  if (dstackSocketExists && !teeCrypto.isDStackKey()) {
+    return res.status(503).json({ error: 'DStack socket present but key not initialized' });
+  }
+
   let totalSuccess = 0;
   let totalFailed = 0;
   let batchCount = 0;
@@ -1754,6 +1787,181 @@ app.post('/migrate/process-pending', async (req, res) => {
       error: error.message,
       processed_before_error: totalSuccess,
       failed_before_error: totalFailed
+    });
+  }
+});
+
+/**
+ * POST /migrate/verify-encryption
+ * Classifies each user's cookies by which key can decrypt them.
+ * Auth: X-Migration-Key header.
+ */
+app.post('/migrate/verify-encryption', async (req, res) => {
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
+  const xordiApiKey = process.env.XORDI_API_KEY;
+
+  if (!xordiApiKey) {
+    return res.status(500).json({ error: 'XORDI_API_KEY not configured' });
+  }
+
+  let totalSampled = 0;
+  let encryptedWithFallback = 0;
+  let encryptedWithDstack = 0;
+  let decryptionFailedBoth = 0;
+  let offset = 0;
+
+  try {
+    while (true) {
+      const response = await axios.get(
+        `${xordiApiUrl}/api/enclave/migrate/all-encrypted-users?offset=${offset}`,
+        { headers: { 'X-Api-Key': xordiApiKey } }
+      );
+
+      const users = response.data.users || [];
+      if (users.length === 0) break;
+
+      for (const user of users) {
+        totalSampled++;
+        const hex = user.tee_encrypted_cookies;
+
+        if (teeCrypto.canDecryptWithFallback(hex)) {
+          encryptedWithFallback++;
+        } else {
+          try {
+            teeCrypto.decryptCookies(hex);
+            encryptedWithDstack++;
+          } catch (e) {
+            decryptionFailedBoth++;
+          }
+        }
+      }
+
+      offset += users.length;
+    }
+
+    res.json({
+      total_sampled: totalSampled,
+      encrypted_with_fallback: encryptedWithFallback,
+      encrypted_with_dstack: encryptedWithDstack,
+      decryption_failed_both: decryptionFailedBoth,
+      dstack_key_active: teeCrypto.isDStackKey()
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /migrate/upgrade-to-tee-key
+ * Re-encrypts all fallback-encrypted cookies with the DStack-derived key.
+ * Self-paginating: processes all users in batches of 50 internally.
+ * Auth: X-Migration-Key header.
+ * Precondition: DStack key must be active.
+ */
+app.post('/migrate/upgrade-to-tee-key', async (req, res) => {
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  if (!teeCrypto.isDStackKey()) {
+    return res.status(503).json({ error: 'DStack key not initialized — cannot re-encrypt' });
+  }
+
+  const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
+  const xordiApiKey = process.env.XORDI_API_KEY;
+
+  if (!xordiApiKey) {
+    return res.status(500).json({ error: 'XORDI_API_KEY not configured' });
+  }
+
+  let totalProcessed = 0;
+  let reEncrypted = 0;
+  let alreadyDstack = 0;
+  let failedBothKeys = 0;
+  const failedUsers: string[] = [];
+  let batchCount = 0;
+  let offset = 0;
+
+  try {
+    while (true) {
+      batchCount++;
+
+      const response = await axios.get(
+        `${xordiApiUrl}/api/enclave/migrate/all-encrypted-users?offset=${offset}`,
+        { headers: { 'X-Api-Key': xordiApiKey } }
+      );
+
+      const users = response.data.users || [];
+      if (users.length === 0) break;
+
+      console.log(`🔄 Re-encryption batch ${batchCount}: ${users.length} users (offset ${offset})...`);
+
+      for (const user of users) {
+        totalProcessed++;
+        const hex = user.tee_encrypted_cookies;
+
+        try {
+          // Try fallback key first
+          if (teeCrypto.canDecryptWithFallback(hex)) {
+            const plaintext = teeCrypto._decryptWithFallbackKey(hex);
+            const reEncryptedHex = teeCrypto.encryptCookies(plaintext);
+
+            await axios.post(
+              `${xordiApiUrl}/api/enclave/migrate/complete`,
+              { sec_user_id: user.sec_user_id, tee_encrypted_cookies: reEncryptedHex },
+              { headers: { 'X-Api-Key': xordiApiKey } }
+            );
+
+            reEncrypted++;
+          } else {
+            // Try current (DStack) key — already migrated
+            try {
+              teeCrypto.decryptCookies(hex);
+              alreadyDstack++;
+            } catch (e) {
+              failedBothKeys++;
+              failedUsers.push(user.sec_user_id);
+              console.error(`❌ ${user.sec_user_id}: both keys failed`);
+            }
+          }
+        } catch (err: any) {
+          failedBothKeys++;
+          failedUsers.push(user.sec_user_id);
+          console.error(`❌ ${user.sec_user_id}: ${err.message}`);
+        }
+      }
+
+      offset += users.length;
+      console.log(`   Batch ${batchCount}: ${reEncrypted} re-encrypted, ${alreadyDstack} already DStack, ${failedBothKeys} failed`);
+    }
+
+    res.json({
+      total_processed: totalProcessed,
+      re_encrypted: reEncrypted,
+      already_dstack: alreadyDstack,
+      failed_both_keys: failedBothKeys,
+      failed_users: failedUsers,
+      batches: batchCount
+    });
+  } catch (error: any) {
+    console.error('Re-encryption failed:', error.message);
+    res.status(500).json({
+      error: error.message,
+      total_processed: totalProcessed,
+      re_encrypted: reEncrypted,
+      already_dstack: alreadyDstack,
+      failed_both_keys: failedBothKeys,
+      failed_users: failedUsers
     });
   }
 });
@@ -1859,7 +2067,9 @@ app.get('/health', (req, res) => {
     uptime: (Date.now() - startTime) / 1000,
     sessions: sessionManager?.getSessionCount() || 0,
     dstack: !!dstackSDK,
+    dstackInitialized: !!dstackSDK,
     encryption: !!encryptionKey,
+    cookieEncryption: teeCrypto.isDStackKey() ? 'dstack' : 'fallback',
     timestamp: new Date().toISOString()
   });
 });

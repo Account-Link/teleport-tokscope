@@ -1,52 +1,63 @@
 /**
  * TEE Cryptography Utilities
  * Handles cookie encryption/decryption with TEE-derived keys
+ *
+ * Key lifecycle:
+ * 1. Constructor: starts with fallback key (for staging or until DStack initializes)
+ * 2. setDStackKey(): called by initDStack() after TEE key derivation succeeds
+ * 3. All encrypt/decrypt operations use this.encryptionKey (whichever is active)
+ * 4. decryptCookiesWithFallback(): tries current key, falls back to hardcoded key
  */
 
 const crypto = require('crypto');
 
+const FALLBACK_KEY_MATERIAL = 'tee-enclave-key-material-32chars';
+
 class TEECrypto {
   constructor() {
-    // TEE-derived encryption key (AES-256-GCM)
-    // In production, this would be derived from Dstack SDK or hardware TEE
-    // For now, using environment variable or default (for staging/testing)
-    const keyMaterial = process.env.TEE_ENCRYPTION_KEY || 'tee-enclave-key-material-32chars';
-
-    // Derive 32-byte key via SHA-256
+    // Start with fallback key (for staging or until DStack initializes)
+    const keyMaterial = process.env.TEE_ENCRYPTION_KEY || FALLBACK_KEY_MATERIAL;
     this.encryptionKey = crypto.createHash('sha256').update(keyMaterial).digest();
-
-    console.log('🔐 TEE crypto initialized (AES-256-GCM)');
+    this._usingDStackKey = false;
+    console.log('🔐 TEE crypto initialized with fallback key (awaiting DStack)');
   }
 
   /**
-   * Encrypt cookies with TEE-derived key
+   * Upgrade encryption key to DStack-derived key
+   * Called by initDStack() in server.ts after successful TEE key derivation
+   */
+  setDStackKey(derivedKeyBuffer) {
+    this.encryptionKey = derivedKeyBuffer;
+    this._usingDStackKey = true;
+    console.log('🔐 TEE crypto upgraded to DStack-derived key');
+  }
+
+  /**
+   * Check if currently using DStack-derived key
+   */
+  isDStackKey() {
+    return this._usingDStackKey === true;
+  }
+
+  /**
+   * Encrypt cookies with current key (AES-256-GCM)
    * @param {any} cookiesData - Cookies array or string
    * @returns {string} Hex-encoded encrypted data
    */
   encryptCookies(cookiesData) {
     try {
-      // Convert to JSON string
       const plaintext = JSON.stringify(cookiesData);
-
-      // Generate random IV (12 bytes for GCM)
       const iv = crypto.randomBytes(12);
-
-      // Create cipher
       const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
 
-      // Encrypt data
       let encrypted = cipher.update(plaintext, 'utf8');
       encrypted = Buffer.concat([encrypted, cipher.final()]);
 
-      // Get authentication tag
       const authTag = cipher.getAuthTag();
 
-      // Combine: IV (12) + AuthTag (16) + Ciphertext
+      // Wire format: IV (12) + AuthTag (16) + Ciphertext
       const combined = Buffer.concat([iv, authTag, encrypted]);
-
-      // Return as hex string
       return combined.toString('hex');
-
     } catch (error) {
       console.error('Cookie encryption failed:', error);
       throw new Error('TEE encryption failed');
@@ -54,35 +65,77 @@ class TEECrypto {
   }
 
   /**
-   * Decrypt cookies with TEE-derived key
+   * Decrypt cookies with current key (AES-256-GCM)
    * @param {string} encryptedHex - Hex-encoded encrypted data
    * @returns {any} Decrypted cookies data
    */
   decryptCookies(encryptedHex) {
     try {
-      // Convert from hex
       const combined = Buffer.from(encryptedHex, 'hex');
-
-      // Extract components
       const iv = combined.slice(0, 12);
       const authTag = combined.slice(12, 28);
       const encrypted = combined.slice(28);
 
-      // Create decipher
       const decipher = crypto.createDecipheriv('aes-256-gcm', this.encryptionKey, iv);
       decipher.setAuthTag(authTag);
 
-      // Decrypt
       let decrypted = decipher.update(encrypted);
       decrypted = Buffer.concat([decrypted, decipher.final()]);
 
-      // Parse JSON
       return JSON.parse(decrypted.toString('utf8'));
-
     } catch (error) {
       console.error('Cookie decryption failed:', error);
       throw new Error('TEE decryption failed');
     }
+  }
+
+  /**
+   * Try current key first, fall back to hardcoded key if DStack key fails.
+   * Used on decrypt paths so existing fallback-encrypted cookies still work
+   * after DStack key is active.
+   */
+  decryptCookiesWithFallback(encryptedHex) {
+    try {
+      return this.decryptCookies(encryptedHex);
+    } catch (e) {
+      if (this._usingDStackKey) {
+        console.log('⚠️ DStack key failed, trying fallback key...');
+        return this._decryptWithFallbackKey(encryptedHex);
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Check if data can be decrypted with the hardcoded fallback key.
+   * Used by verify-encryption to classify cookies.
+   */
+  canDecryptWithFallback(encryptedHex) {
+    try {
+      this._decryptWithFallbackKey(encryptedHex);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Decrypt with the hardcoded fallback key (for migration/verification)
+   */
+  _decryptWithFallbackKey(encryptedHex) {
+    const fallbackKey = crypto.createHash('sha256').update(FALLBACK_KEY_MATERIAL).digest();
+    const combined = Buffer.from(encryptedHex, 'hex');
+    const iv = combined.slice(0, 12);
+    const authTag = combined.slice(12, 28);
+    const encrypted = combined.slice(28);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', fallbackKey, iv);
+    decipher.setAuthTag(authTag);
+
+    let decrypted = decipher.update(encrypted);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+
+    return JSON.parse(decrypted.toString('utf8'));
   }
 
   /**
