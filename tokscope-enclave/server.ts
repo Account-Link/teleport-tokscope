@@ -1967,6 +1967,195 @@ app.post('/migrate/upgrade-to-tee-key', async (req, res) => {
 });
 
 // ============================================================================
+// TEE-TO-TEE MIGRATION ENDPOINTS
+// ============================================================================
+
+/**
+ * POST /migrate/encrypt-incoming
+ * Accepts plaintext cookies from the old TEE, encrypts with local DStack key.
+ * Called by the old TEE during TEE-to-TEE migration.
+ * Auth: X-Migration-Key header.
+ * Precondition: DStack key must be initialized.
+ */
+app.post('/migrate/encrypt-incoming', async (req, res) => {
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  if (!teeCrypto.isDStackKey()) {
+    return res.status(503).json({ error: 'DStack key not initialized' });
+  }
+
+  try {
+    const { sec_user_id, cookies } = req.body;
+
+    if (!sec_user_id || !cookies) {
+      return res.status(400).json({ error: 'Missing sec_user_id or cookies' });
+    }
+
+    const encryptedHex = teeCrypto.encryptCookies(cookies);
+
+    res.json({
+      success: true,
+      encrypted_hex: encryptedHex,
+      sec_user_id
+    });
+  } catch (error: any) {
+    console.error('encrypt-incoming failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /migrate/verify-decrypt
+ * Accepts an encrypted hex blob, attempts decryption, returns success/failure.
+ * Used by the old TEE to verify the new TEE can decrypt re-encrypted cookies.
+ * Auth: X-Migration-Key header.
+ * Precondition: DStack key must be initialized.
+ */
+app.post('/migrate/verify-decrypt', async (req, res) => {
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  if (!teeCrypto.isDStackKey()) {
+    return res.status(503).json({ error: 'DStack key not initialized' });
+  }
+
+  try {
+    const { encrypted_hex, sec_user_id } = req.body;
+
+    if (!encrypted_hex || !sec_user_id) {
+      return res.status(400).json({ error: 'Missing encrypted_hex or sec_user_id' });
+    }
+
+    try {
+      teeCrypto.decryptCookies(encrypted_hex);
+      res.json({ success: true, can_decrypt: true, sec_user_id });
+    } catch (decryptError) {
+      res.json({ success: true, can_decrypt: false, sec_user_id });
+    }
+  } catch (error: any) {
+    console.error('verify-decrypt failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /migrate/tee-to-tee-single
+ * Processes a single user: decrypts with old DStack key, sends plaintext to new TEE
+ * for re-encryption, verifies both directions, returns result to Borgcube.
+ * Auth: X-Migration-Key header.
+ * Precondition: DStack key must be initialized.
+ * Env required: MIGRATION_TARGET_TEE_URL, MIGRATION_TARGET_API_KEY
+ */
+app.post('/migrate/tee-to-tee-single', async (req, res) => {
+  const triggerKey = req.header('X-Migration-Key');
+  const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
+
+  if (!expectedKey || triggerKey !== expectedKey) {
+    return res.status(401).json({ error: 'Invalid or missing X-Migration-Key' });
+  }
+
+  if (!teeCrypto.isDStackKey()) {
+    return res.status(503).json({ error: 'DStack key not initialized' });
+  }
+
+  const targetTeeUrl = process.env.MIGRATION_TARGET_TEE_URL;
+  const targetApiKey = process.env.MIGRATION_TARGET_API_KEY;
+
+  if (!targetTeeUrl || !targetApiKey) {
+    return res.status(500).json({ error: 'MIGRATION_TARGET_TEE_URL or MIGRATION_TARGET_API_KEY not configured' });
+  }
+
+  try {
+    const { sec_user_id, encrypted_hex } = req.body;
+
+    if (!sec_user_id || !encrypted_hex) {
+      return res.status(400).json({ error: 'Missing sec_user_id or encrypted_hex' });
+    }
+
+    // Step 1: Decrypt with old (local) DStack key
+    let plaintext: any;
+    try {
+      plaintext = teeCrypto.decryptCookies(encrypted_hex);
+    } catch (decryptError: any) {
+      return res.json({
+        success: false,
+        sec_user_id,
+        error: `Decryption failed with current key: ${decryptError.message}`
+      });
+    }
+
+    // Step 2: Send plaintext to new TEE for re-encryption
+    const encryptResponse = await axios.post(
+      `${targetTeeUrl}/migrate/encrypt-incoming`,
+      { sec_user_id, cookies: plaintext },
+      {
+        headers: { 'X-Migration-Key': targetApiKey },
+        timeout: 30000
+      }
+    );
+
+    if (!encryptResponse.data.success || !encryptResponse.data.encrypted_hex) {
+      return res.json({
+        success: false,
+        sec_user_id,
+        error: `New TEE encrypt-incoming failed: ${encryptResponse.data.error || 'no encrypted_hex returned'}`
+      });
+    }
+
+    const newEncryptedHex = encryptResponse.data.encrypted_hex;
+
+    // Step 3: Verify new TEE can decrypt the new blob
+    const verifyResponse = await axios.post(
+      `${targetTeeUrl}/migrate/verify-decrypt`,
+      { sec_user_id, encrypted_hex: newEncryptedHex },
+      {
+        headers: { 'X-Migration-Key': targetApiKey },
+        timeout: 30000
+      }
+    );
+
+    const newTeeCanDecrypt = verifyResponse.data.can_decrypt === true;
+
+    // Step 4: Verify old TEE CANNOT decrypt the new blob (key isolation)
+    let oldTeeCannotDecrypt = false;
+    try {
+      teeCrypto.decryptCookies(newEncryptedHex);
+      // If we get here, old TEE CAN decrypt — key isolation failed
+      oldTeeCannotDecrypt = false;
+    } catch (e) {
+      // Expected: AES-GCM auth tag mismatch proves different keys
+      oldTeeCannotDecrypt = true;
+    }
+
+    res.json({
+      success: true,
+      sec_user_id,
+      new_encrypted_hex: newEncryptedHex,
+      verification: {
+        new_tee_can_decrypt: newTeeCanDecrypt,
+        old_tee_cannot_decrypt: oldTeeCannotDecrypt
+      }
+    });
+  } catch (error: any) {
+    console.error(`tee-to-tee-single failed for ${req.body?.sec_user_id}:`, error.message);
+    res.json({
+      success: false,
+      sec_user_id: req.body?.sec_user_id,
+      error: error.message
+    });
+  }
+});
+
+// ============================================================================
 
 const startTime = Date.now();
 
