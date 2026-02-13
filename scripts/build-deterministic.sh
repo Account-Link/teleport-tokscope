@@ -30,14 +30,14 @@ echo "✅ API hash: $API_HASH"
 
 # Build Manager
 echo ""
-echo "🔨 Building tokscope-enclave-manager..."
+echo "🔨 Building tokscope-browser-manager..."
 time docker buildx build \
   $BUILD_ARGS \
   -f tokscope-enclave/Dockerfile.browser-manager \
-  --output type=docker,dest=tokscope-enclave-manager.tar,rewrite-timestamp=true \
+  --output type=docker,dest=tokscope-browser-manager.tar,rewrite-timestamp=true \
   .
 
-MGR_HASH=$(sha256sum tokscope-enclave-manager.tar | awk '{print $1}')
+MGR_HASH=$(sha256sum tokscope-browser-manager.tar | awk '{print $1}')
 echo "✅ Manager hash: $MGR_HASH"
 
 # Build Browser
@@ -77,10 +77,10 @@ echo "  Rebuilding Manager..."
 docker buildx build \
   $BUILD_ARGS \
   -f tokscope-enclave/Dockerfile.browser-manager \
-  --output type=docker,dest=tokscope-enclave-manager-verify.tar,rewrite-timestamp=true \
+  --output type=docker,dest=tokscope-browser-manager-verify.tar,rewrite-timestamp=true \
   . >/dev/null 2>&1
 
-VERIFY_MGR_HASH=$(sha256sum tokscope-enclave-manager-verify.tar | awk '{print $1}')
+VERIFY_MGR_HASH=$(sha256sum tokscope-browser-manager-verify.tar | awk '{print $1}')
 
 if [[ "$MGR_HASH" == "$VERIFY_MGR_HASH" ]]; then
   echo "  ✅ Manager is deterministic"
@@ -106,7 +106,7 @@ else
 fi
 
 # Cleanup verify artifacts
-rm -f tokscope-enclave-api-verify.tar tokscope-enclave-manager-verify.tar tokscope-browser-verify.tar
+rm -f tokscope-enclave-api-verify.tar tokscope-browser-manager-verify.tar tokscope-browser-verify.tar
 
 # Save manifest
 cat > build-manifest.json << EOF
@@ -131,7 +131,7 @@ echo ""
 # Load into Docker and tag for registry
 echo "📦 Loading images into Docker..."
 API_IMAGE=$(docker load < tokscope-enclave-api.tar | grep "Loaded image" | awk '{print $NF}')
-MGR_IMAGE=$(docker load < tokscope-enclave-manager.tar | grep "Loaded image" | awk '{print $NF}')
+MGR_IMAGE=$(docker load < tokscope-browser-manager.tar | grep "Loaded image" | awk '{print $NF}')
 BROWSER_IMAGE=$(docker load < tokscope-browser.tar | grep "Loaded image" | awk '{print $NF}')
 
 echo "  Loaded: $API_IMAGE"
@@ -144,8 +144,8 @@ echo ""
 echo "🏷️  Tagging for registry: $REGISTRY"
 docker tag $API_IMAGE $REGISTRY/tokscope-enclave-api:latest
 docker tag $API_IMAGE $REGISTRY/tokscope-enclave-api:$(echo $API_HASH | cut -c1-12)
-docker tag $MGR_IMAGE $REGISTRY/tokscope-enclave-manager:latest
-docker tag $MGR_IMAGE $REGISTRY/tokscope-enclave-manager:$(echo $MGR_HASH | cut -c1-12)
+docker tag $MGR_IMAGE $REGISTRY/tokscope-browser-manager:latest
+docker tag $MGR_IMAGE $REGISTRY/tokscope-browser-manager:$(echo $MGR_HASH | cut -c1-12)
 docker tag $BROWSER_IMAGE $REGISTRY/tokscope-browser:latest
 docker tag $BROWSER_IMAGE $REGISTRY/tokscope-browser:$(echo $BROWSER_HASH | cut -c1-12)
 
@@ -153,13 +153,13 @@ echo ""
 echo "✅ Images tagged:"
 echo "  - $REGISTRY/tokscope-enclave-api:latest"
 echo "  - $REGISTRY/tokscope-enclave-api:$(echo $API_HASH | cut -c1-12)"
-echo "  - $REGISTRY/tokscope-enclave-manager:latest"
-echo "  - $REGISTRY/tokscope-enclave-manager:$(echo $MGR_HASH | cut -c1-12)"
+echo "  - $REGISTRY/tokscope-browser-manager:latest"
+echo "  - $REGISTRY/tokscope-browser-manager:$(echo $MGR_HASH | cut -c1-12)"
 echo "  - $REGISTRY/tokscope-browser:latest"
 echo "  - $REGISTRY/tokscope-browser:$(echo $BROWSER_HASH | cut -c1-12)"
 echo ""
 echo "🚀 To push to DockerHub:"
 echo "  REGISTRY=docker.io/username ./scripts/build-deterministic.sh"
 echo "  docker push $REGISTRY/tokscope-enclave-api:latest"
-echo "  docker push $REGISTRY/tokscope-enclave-manager:latest"
+echo "  docker push $REGISTRY/tokscope-browser-manager:latest"
 echo "  docker push $REGISTRY/tokscope-browser:latest"

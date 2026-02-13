@@ -1,4 +1,4 @@
-FROM ghcr.io/m1k1o/neko/chromium:latest
+FROM ghcr.io/m1k1o/neko/chromium@sha256:23472d1adf85a0e170c56326f58928bfa716c7ade0ef9d87d54af15116c8639c
 
 # Build arg to specify config source (defaults to enclave for production)
 ARG CHROMIUM_CONF_SOURCE=tokscope-enclave

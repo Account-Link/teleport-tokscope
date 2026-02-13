@@ -55,6 +55,12 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} TZ=UTC \
     npm_config_cache=/npm-cache
 
 # FORCE ORDERING: Install system packages FIRST, then copy built code, then npm install
+# Step 0.5: Pin apt to Debian snapshot for reproducible builds
+RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot && \
+    echo "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" > /etc/apt/sources.list && \
+    echo "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" >> /etc/apt/sources.list && \
+    rm -f /etc/apt/sources.list.d/*
+
 # Step 1: System packages (including Python for security service subprocess)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -70,10 +76,10 @@ RUN apt-get update && \
 
 # Step 1.5: Install Python packages for security service
 RUN pip3 install --no-cache-dir --break-system-packages \
-    fastapi \
-    pydantic \
-    pycryptodome \
-    protobuf
+    fastapi==0.104.1 \
+    pydantic==2.5.0 \
+    pycryptodome==3.19.0 \
+    protobuf==4.25.5
 
 WORKDIR /app
 
