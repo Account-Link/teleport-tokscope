@@ -11,7 +11,12 @@
 
 const crypto = require('crypto');
 
-const FALLBACK_KEY_MATERIAL = 'tee-enclave-key-material-32chars';
+const FALLBACK_KEY_MATERIAL = process.env.FALLBACK_KEY_MATERIAL;
+if (!FALLBACK_KEY_MATERIAL) {
+  console.error('FATAL: FALLBACK_KEY_MATERIAL environment variable is required.');
+  console.error('This key is used for cookie encryption fallback when DStack is not initialized.');
+  process.exit(1);
+}
 
 class TEECrypto {
   constructor() {

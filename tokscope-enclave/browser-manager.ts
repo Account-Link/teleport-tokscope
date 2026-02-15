@@ -37,6 +37,7 @@ class BrowserManager {
   private containerPool: string[] = [];
   private isInitialized = false;
   private isMaintenanceRunning = false; // NEW: Lock flag for pool maintenance
+  private intervalIds: NodeJS.Timeout[] = [];
 
   initialize(): void {
     this.isInitialized = true;
@@ -406,7 +407,7 @@ class BrowserManager {
   private startCleanupInterval(): void {
     const timeoutMs = this.config.tcb?.container_idle_timeout_ms || 600000;
 
-    setInterval(async () => {
+    this.intervalIds.push(setInterval(async () => {
       const now = Date.now();
       const toDestroy: string[] = [];
 
@@ -424,13 +425,13 @@ class BrowserManager {
       if (toDestroy.length > 0) {
         console.log(`🧹 Cleaned up ${toDestroy.length} idle containers. Active: ${this.containers.size}`);
       }
-    }, 60000); // Check every minute
+    }, 60000)); // Check every minute
   }
 
   private startPoolMaintenance(): void {
     const CHECK_INTERVAL_MS = 30000; // Check every 30 seconds
 
-    setInterval(async () => {
+    this.intervalIds.push(setInterval(async () => {
       // LOCK: Prevent multiple maintenance cycles from running concurrently
       if (this.isMaintenanceRunning) {
         console.log('⏭️  Pool maintenance already running, skipping cycle...');
@@ -478,7 +479,7 @@ class BrowserManager {
         // UNLOCK: Allow next maintenance cycle
         this.isMaintenanceRunning = false;
       }
-    }, CHECK_INTERVAL_MS);
+    }, CHECK_INTERVAL_MS));
 
     console.log(`🔧 Pool maintenance started (min size: ${MIN_POOL_SIZE}, check every ${CHECK_INTERVAL_MS / 1000}s)`);
   }
@@ -520,6 +521,18 @@ class BrowserManager {
 
   getPoolSize(): number {
     return this.containerPool.length;
+  }
+
+  async shutdown(): Promise<void> {
+    console.log('Shutting down browser manager...');
+    this.intervalIds.forEach(id => clearInterval(id));
+    this.intervalIds = [];
+
+    const containerIds = Array.from(this.containers.keys());
+    for (const containerId of containerIds) {
+      await this.destroyContainer(containerId);
+    }
+    console.log(`Browser manager shutdown complete (${containerIds.length} containers destroyed)`);
   }
 
   getStats(): { total: number; available: number; assigned: number; sessions: number; poolSize: number } {
@@ -695,9 +708,19 @@ async function main() {
     res.json({ status: 'healthy', timestamp: new Date().toISOString() });
   });
 
-  app.listen(port, '0.0.0.0', () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`🎭 Browser Manager HTTP server running on port ${port}`);
   });
+
+  async function gracefulShutdown(signal: string) {
+    console.log(`\n${signal} received. Shutting down browser-manager...`);
+    server.close();
+    await browserManager.shutdown();
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 if (require.main === module) {

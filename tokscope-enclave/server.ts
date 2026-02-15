@@ -83,9 +83,11 @@ interface DebugScreenshot {
 
 const debugScreenshots = new Map<string, DebugScreenshot>();
 const DEBUG_SCREENSHOT_TTL_MS = parseInt(process.env.DEBUG_SCREENSHOT_TTL_MS || '300000'); // 5 min default
+const serverIntervalIds: NodeJS.Timeout[] = [];
+let httpServer: ReturnType<typeof app.listen> | null = null;
 
 // Cleanup expired screenshots every minute
-setInterval(() => {
+serverIntervalIds.push(setInterval(() => {
   if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') return;
   const now = Date.now();
   for (const [token, screenshot] of debugScreenshots.entries()) {
@@ -93,7 +95,7 @@ setInterval(() => {
       debugScreenshots.delete(token);
     }
   }
-}, 60000);
+}, 60000));
 
 // z-4: Track step counter per auth session
 const authScreenshotSteps = new Map<string, number>();
@@ -356,6 +358,7 @@ async function destroyAuthContainer(sessionId: string): Promise<void> {
 class SessionManager {
   private sessions = new Map<string, SessionData>();
   private lastAccess = new Map<string, number>();
+  private cleanupIntervalId: NodeJS.Timeout | null = null;
   private config: Config = {
     tcb: {
       session_timeout_ms: 3600000 // 1 hour
@@ -401,7 +404,7 @@ class SessionManager {
   private startCleanupInterval(): void {
     const timeoutMs = this.config.tcb?.session_timeout_ms || 3600000;
 
-    setInterval(() => {
+    this.cleanupIntervalId = setInterval(() => {
       const now = Date.now();
       const expired: string[] = [];
 
@@ -420,6 +423,15 @@ class SessionManager {
         console.log(`🧹 Cleaned up ${expired.length} expired sessions. Active: ${this.getSessionCount()}`);
       }
     }, 300000); // Check every 5 minutes
+  }
+
+  shutdown(): void {
+    if (this.cleanupIntervalId) {
+      clearInterval(this.cleanupIntervalId);
+      this.cleanupIntervalId = null;
+    }
+    this.sessions.clear();
+    this.lastAccess.clear();
   }
 }
 
@@ -2302,7 +2314,36 @@ app.get('/ready', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+function validateEnvironment(): void {
+  const errors: string[] = [];
+
+  const apiKeys = (process.env.XORDI_API_KEY || '').split(',').filter(k => k);
+  if (apiKeys.length === 0) {
+    errors.push('XORDI_API_KEY is required (comma-separated list of allowed API keys)');
+  }
+
+  const proxyMode = process.env.PROXY_MODE || 'wireguard';
+  if (proxyMode === 'wireguard') {
+    if (!process.env.WG_PROXY_USER) errors.push('WG_PROXY_USER is required when PROXY_MODE=wireguard');
+    if (!process.env.WG_PROXY_PASS) errors.push('WG_PROXY_PASS is required when PROXY_MODE=wireguard');
+  } else if (proxyMode === 'ipfoxy') {
+    if (!process.env.IPFOXY_ACCOUNT) errors.push('IPFOXY_ACCOUNT is required when PROXY_MODE=ipfoxy');
+    if (!process.env.IPFOXY_PASSWORD) errors.push('IPFOXY_PASSWORD is required when PROXY_MODE=ipfoxy');
+  }
+
+  if (errors.length > 0) {
+    console.error('========================================');
+    console.error('FATAL: Environment validation failed:');
+    errors.forEach(e => console.error(`  - ${e}`));
+    console.error('========================================');
+    process.exit(1);
+  }
+
+  console.log(`Environment validation passed (proxy_mode=${proxyMode}, api_keys=${apiKeys.length})`);
+}
+
 async function startServer(): Promise<void> {
+  validateEnvironment();
   await initDStack();
 
   sessionManager = new SessionManager();
@@ -2319,15 +2360,42 @@ async function startServer(): Promise<void> {
   console.log('🔐 Xordi security module initialized');
 
   // Cleanup expired auth sessions periodically
-  setInterval(async () => {
+  serverIntervalIds.push(setInterval(async () => {
     await authSessionManager?.cleanupExpired();
-  }, 60000); // Every minute
+  }, 60000)); // Every minute
 
-  app.listen(PORT, () => {
+  httpServer = app.listen(PORT, () => {
     console.log(`🚀 Multi-User TCB Server running on port ${PORT}`);
     console.log(`📊 Session timeout: ${Math.round(3600000 / 60000)} minutes`);
     console.log(`🔐 Auth session timeout: ${Math.round(120000 / 1000)} seconds`);
   });
 }
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`\n${signal} received. Starting graceful shutdown...`);
+
+  serverIntervalIds.forEach(id => clearInterval(id));
+  console.log(`Cleared ${serverIntervalIds.length} server intervals`);
+
+  if (httpServer) {
+    httpServer.close(() => {
+      console.log('HTTP server closed to new connections');
+    });
+  }
+
+  if (sessionManager) {
+    sessionManager.shutdown();
+    console.log('Session manager shut down');
+  }
+
+  // Allow in-flight requests 5s to complete (Docker SIGKILL at 10s)
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  console.log('Graceful shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 startServer().catch(console.error);
