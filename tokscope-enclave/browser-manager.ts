@@ -287,7 +287,8 @@ class BrowserManager {
       }
 
       // Random bucket for QR auth (no sec_user_id yet - will be assigned deterministically after login)
-      const bucket = Math.floor(Math.random() * 10);
+      const bucketCount = parseInt(process.env.WIREGUARD_BUCKET_COUNT || '2');
+      const bucket = Math.floor(Math.random() * bucketCount);
       const port = wgBasePort + bucket;
 
       configPayload = JSON.stringify({
