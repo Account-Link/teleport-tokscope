@@ -1115,6 +1115,20 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
   }
 });
 
+app.post('/auth/destroy/:authSessionId', async (req, res) => {
+  try {
+    const { authSessionId } = req.params;
+    if (!/^[a-f0-9\-]{36}$/.test(authSessionId)) {
+      return res.status(400).json({ error: 'Invalid authSessionId format' });
+    }
+    await destroyAuthContainer(authSessionId);
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Auth destroy error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Playwright-based sampling endpoints
 app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
   try {
