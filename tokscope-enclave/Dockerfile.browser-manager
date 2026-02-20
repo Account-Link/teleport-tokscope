@@ -62,12 +62,12 @@ RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot 
     echo "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" >> /etc/apt/sources.list && \
     rm -f /etc/apt/sources.list.d/*
 
-# Step 1: System packages
+# Step 1: System packages (versions pinned by DEBIAN_SNAPSHOT)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    docker.io=20.10.24+dfsg1-1+deb12u1+b3 \
-    curl=7.88.1-10+deb12u14 \
-    ca-certificates=20230311+deb12u1 && \
+    docker.io \
+    curl \
+    ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /var/log/apt/* && \

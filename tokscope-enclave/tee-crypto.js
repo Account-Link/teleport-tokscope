@@ -11,7 +11,7 @@
 
 const crypto = require('crypto');
 
-const FALLBACK_KEY_MATERIAL = 'tee-enclave-key-material-32chars';
+const FALLBACK_KEY_MATERIAL = process.env.FALLBACK_KEY_MATERIAL || 'tee-enclave-key-material-32chars';
 
 class TEECrypto {
   constructor() {
