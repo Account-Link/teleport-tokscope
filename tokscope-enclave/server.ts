@@ -181,6 +181,7 @@ class AuthSessionManager {
 
   removeAuthSession(authSessionId: string): void {
     this.authSessions.delete(authSessionId);
+    authScreenshotSteps.delete(authSessionId);
   }
 
   async cleanupExpired(): Promise<void> {
@@ -1570,7 +1571,8 @@ app.post('/api/tiktok/execute', async (req, res) => {
           'cmpl_token', 'multi_sids',
           'tt_session_tlb_tag'
         ];
-        const filteredCookies = cookies.filter((c: any) => mobileCookieNames.includes(c.name));
+        const mobileCookieNameSet = new Set(mobileCookieNames);
+        const filteredCookies = cookies.filter((c: any) => mobileCookieNameSet.has(c.name));
         cookieString = filteredCookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
       }
     }

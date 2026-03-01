@@ -386,7 +386,8 @@ class BrowserAutomationClient {
     // v3-o: Validate ALL 6 required cookies - this is what working extractions have
     const requiredCookies = ['sessionid', 'msToken', 'ttwid', 'sid_guard', 'uid_tt', 'sid_tt'];
 
-    const missingRequired = requiredCookies.filter(name => !cookieNames.includes(name));
+    const cookieNameSet = new Set(cookieNames);
+    const missingRequired = requiredCookies.filter(name => !cookieNameSet.has(name));
     if (missingRequired.length > 0) {
       console.error(`Validation failed: missing cookies: ${missingRequired.join(', ')}`);
       throw new Error(`Auth failed: missing cookies: ${missingRequired.join(', ')}`);
