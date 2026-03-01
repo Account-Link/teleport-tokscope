@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 
 const DEFAULT_NODE_ID = 12;
-const DEFAULT_KMS_ID = 'kms-base-prod7';
+const DEFAULT_KMS_ID = 'kms-base-prod5';
 const DEFAULT_COMPOSE = './docker-compose-audit.yml';
 
 function showUsage() {

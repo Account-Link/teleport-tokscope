@@ -199,7 +199,7 @@ Monitor and interact with deployed CVMs.
 
 ```bash
 # Test connectivity
-./enclave-tools/dstack-monitor.js test <app-id> --gateway dstack-base-prod7.phala.network
+./enclave-tools/dstack-monitor.js test <app-id> --gateway dstack-base-prod5.phala.network
 
 # Check logs
 ./enclave-tools/dstack-monitor.js logs <app-id> tokscope-enclave
@@ -218,7 +218,7 @@ Dstack exposes services via gateway URLs:
 **Example:**
 ```bash
 # Health check (replace with your instance ID and gateway)
-curl https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-3000.dstack-base-prod7.phala.network/health
+curl https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-3000.dstack-base-prod5.phala.network/health
 ```
 
 See `enclave-tools/dstack-interaction-guide.md` for complete gateway documentation.

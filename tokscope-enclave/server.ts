@@ -133,7 +133,9 @@ async function captureDebugScreenshot(
 
     // Log clickable URL (appears in docker logs)
     const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
-    const screenshotUrl = `${baseUrl}/debug/screenshot/${token}`;
+    const screenshotUrl = baseUrl
+      ? `${baseUrl}/debug/screenshot/${token}`
+      : `/debug/screenshot/${token}`;
     console.log(`📸 Debug screenshot: ${screenshotUrl}`);
     console.log(`   Auth: ${authSessionId.substring(0, 8)}..., Reason: ${reason}`);
 
@@ -1133,6 +1135,9 @@ app.post('/auth/destroy/:authSessionId', async (req, res) => {
 // Playwright-based sampling endpoints
 app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
   try {
+    if (process.env.AUTH_ONLY_MODE === 'true') {
+      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
+    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1176,6 +1181,9 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
 
 app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
   try {
+    if (process.env.AUTH_ONLY_MODE === 'true') {
+      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
+    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1220,6 +1228,9 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
 // Module-based sampling endpoints (placeholder - not primary focus)
 app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
   try {
+    if (process.env.AUTH_ONLY_MODE === 'true') {
+      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
+    }
     const { sessionId } = req.params;
     const { count = 10, module_type = 'web' } = req.body;
 
@@ -1274,6 +1285,9 @@ app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
 
 app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
   try {
+    if (process.env.AUTH_ONLY_MODE === 'true') {
+      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
+    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1319,6 +1333,9 @@ app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
 
 // Deprecated: Use /playwright/foryoupage/sample instead
 app.post('/scrape/:sessionId', async (req, res) => {
+  if (process.env.AUTH_ONLY_MODE === 'true') {
+    return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
+  }
   console.log('⚠️  /scrape endpoint is deprecated, use /playwright/foryoupage/sample instead');
   res.status(410).json({
     error: 'Endpoint deprecated',
@@ -2214,7 +2231,8 @@ app.get('/debug/screenshots', (req, res) => {
     return res.status(401).json({ error: 'Invalid API key' });
   }
 
-  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
+  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL
+    || `${req.protocol}://${req.get('host')}`;
   const now = Date.now();
 
   const screenshots = Array.from(debugScreenshots.entries()).map(([token, ss]) => ({
@@ -2247,7 +2265,8 @@ app.get('/debug/screenshots/:authSessionId', (req, res) => {
   }
 
   const { authSessionId } = req.params;
-  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL || '';
+  const baseUrl = process.env.DEBUG_SCREENSHOT_BASE_URL
+    || `${req.protocol}://${req.get('host')}`;
 
   const screenshots = Array.from(debugScreenshots.entries())
     .filter(([_, ss]) => ss.authSessionId === authSessionId)
@@ -2313,6 +2332,25 @@ app.get('/ready', async (req, res) => {
       error: error.message,
       instance_id: process.env.INSTANCE_ID || 'main'
     });
+  }
+});
+
+// TEE identity + attestation data (public — no auth required)
+app.get('/tee-info', async (req, res) => {
+  try {
+    if (!dstackSDK) {
+      return res.status(503).json({ error: 'DStack not initialized' });
+    }
+    const info = await dstackSDK.info();
+    res.json({
+      app_id: info.app_id,
+      auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
+      compose_hash: info.compose_hash,
+      tcb_info: info.tcb_info,
+      dstack_sdk_version: require('../package.json').dependencies['@phala/dstack-sdk']
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to get TEE info', details: err.message });
   }
 });
 

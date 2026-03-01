@@ -77,7 +77,7 @@ def docker_compose_to_app_compose(docker_compose_path: str) -> Dict[str, Any]:
         "kms_enabled": True,
         "gateway_enabled": True,
         "key_provider": "kms",
-        "key_provider_id": "kms-base-prod7",  # Standard KMS ID for production
+        "key_provider_id": "kms-base-prod5",  # Standard KMS ID for production
         "no_instance_id": False,
         "secure_time": True,
         "allowed_envs": ["BROWSER_MANAGER_URL", "DOCKER_HOST"],

@@ -15,28 +15,28 @@ Where:
 - `{app-id}` - The application ID (e.g., `c651380e78f32f161efcaaaba74f0dca208a980c`)
 - `{instance-id}` - The instance ID (e.g., `fdde6541e7d2da83f02959d6c2d26605ae5ebf7b`)
 - `{port}` - Optional port number (defaults to exposed ports)
-- `{gateway-domain}` - Gateway domain (e.g., `dstack-base-prod7.phala.network`)
+- `{gateway-domain}` - Gateway domain (e.g., `dstack-base-prod5.phala.network`)
 
 ### URL Examples
 
 For our deployment with:
 - App ID: `c651380e78f32f161efcaaaba74f0dca208a980c`
 - Instance ID: `fdde6541e7d2da83f02959d6c2d26605ae5ebf7b`
-- Gateway: `dstack-base-prod7.phala.network`
+- Gateway: `dstack-base-prod5.phala.network`
 
 #### Node Information (Port 8090)
 ```bash
 # Node info page
-https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/
+https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod5.phala.network/
 
 # Or using instance ID
-https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-8090.dstack-base-prod7.phala.network/
+https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-8090.dstack-base-prod5.phala.network/
 ```
 
 #### Application Services (Port 3000)
 ```bash
 # Main application endpoint - Uses INSTANCE ID, not APP ID
-https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-3000.dstack-base-prod7.phala.network/
+https://fdde6541e7d2da83f02959d6c2d26605ae5ebf7b-3000.dstack-base-prod5.phala.network/
 ```
 
 **Important**: Application services use the **Instance ID** (`fdde6541e7d2da83f02959d6c2d26605ae5ebf7b`), while node info uses the **App ID** (`c651380e78f32f161efcaaaba74f0dca208a980c`).
@@ -60,20 +60,20 @@ https://{app-id}-8090.{gateway-domain}/logs/{service-name}?{parameters}
 ### Examples:
 ```bash
 # Get tokscope-enclave service logs (last 20 lines with timestamps)
-curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/tokscope-enclave?text&bare&timestamps&tail=20"
+curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod5.phala.network/logs/tokscope-enclave?text&bare&timestamps&tail=20"
 
 # Get browser-manager service logs
-curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/browser-manager?text&bare&timestamps&tail=20"
+curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod5.phala.network/logs/browser-manager?text&bare&timestamps&tail=20"
 
 # Follow live logs
-curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/logs/tokscope-enclave?text&bare&timestamps&follow"
+curl "https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod5.phala.network/logs/tokscope-enclave?text&bare&timestamps&follow"
 ```
 
 ## Finding Service Names
 
 1. First, visit the node info page to see deployed containers:
    ```bash
-   curl https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod7.phala.network/
+   curl https://c651380e78f32f161efcaaaba74f0dca208a980c-8090.dstack-base-prod5.phala.network/
    ```
 
 2. Look for the "Deployed Containers" table which shows actual service names
@@ -123,7 +123,7 @@ curl -k https://...  # Skip SSL verification
 ## Our Current Deployment
 
 - **App ID**: `c651380e78f32f161efcaaaba74f0dca208a980c`
-- **Gateway**: `dstack-base-prod7.phala.network`
+- **Gateway**: `dstack-base-prod5.phala.network`
 - **Services**: `tokscope-enclave`, `browser-manager`
 - **Main App**: Port 3000
 - **Node Info**: Port 8090

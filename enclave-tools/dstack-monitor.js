@@ -32,7 +32,7 @@ Examples:
   node dstack-monitor.js logs c651380e78f32f161efcaaaba74f0dca208a980c tokscope-enclave
   node dstack-monitor.js status c651380e78f32f161efcaaaba74f0dca208a980c
   node dstack-monitor.js url c651380e78f32f161efcaaaba74f0dca208a980c 3000
-  node dstack-monitor.js test c651380e78f32f161efcaaaba74f0dca208a980c --gateway dstack-base-prod7.phala.network
+  node dstack-monitor.js test c651380e78f32f161efcaaaba74f0dca208a980c --gateway dstack-base-prod5.phala.network
 `);
 }
 
@@ -110,10 +110,10 @@ function detectGateway(appId) {
     }
 
     // Fallback
-    return 'dstack-base-prod7.phala.network';
+    return 'dstack-base-prod5.phala.network';
   } catch (error) {
     console.error('Failed to detect gateway:', error.message);
-    return 'dstack-base-prod7.phala.network';
+    return 'dstack-base-prod5.phala.network';
   }
 }
 

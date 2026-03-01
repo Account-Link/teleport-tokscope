@@ -294,7 +294,7 @@ def docker_compose_to_app_compose(docker_compose_path):
         "kms_enabled": True,
         "gateway_enabled": True,
         "key_provider": "kms",
-        "key_provider_id": "kms-base-prod7",  # Example KMS ID
+        "key_provider_id": "kms-base-prod5",  # Example KMS ID
         "no_instance_id": False,
         "secure_time": True
     }
@@ -586,7 +586,7 @@ To complete the audit, deploy the exact configuration to dstack and verify the h
 
 ```bash
 # 1. Deploy to DStack
-phala deploy --node-id 12 --kms-id kms-base-prod7 docker-compose-audit.yml --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+phala deploy --node-id 12 --kms-id kms-base-prod5 docker-compose-audit.yml --rpc-url $RPC_URL --private-key $PRIVATE_KEY
 
 # 2. Get deployment App ID
 phala cvms list | grep "xordi"
