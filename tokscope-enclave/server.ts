@@ -2347,7 +2347,7 @@ app.get('/tee-info', async (req, res) => {
       auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
       compose_hash: info.compose_hash,
       tcb_info: info.tcb_info,
-      dstack_sdk_version: require('../package.json').dependencies['@phala/dstack-sdk']
+      dstack_sdk_version: (() => { try { return require('./package.json').dependencies['@phala/dstack-sdk']; } catch { return 'unknown'; } })()
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to get TEE info', details: err.message });
