@@ -2344,6 +2344,7 @@ app.get('/tee-info', async (req, res) => {
     const info = await dstackSDK.info();
     res.json({
       app_id: info.app_id,
+      instance_id: info.instance_id,
       auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
       compose_hash: info.compose_hash,
       tcb_info: info.tcb_info,
