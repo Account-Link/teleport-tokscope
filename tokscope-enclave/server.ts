@@ -248,23 +248,30 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     }
   }
 
-  // v3-v: Create OUR context - cookies will be in THIS context
-  // This is the key fix: same connection owns context = cookies visible
-  console.log(`📦 Creating browser context (Solution F: single CDP owner)...`);
+  // v1.1.3F2: Reuse default context + pre-navigated page (tiktok.com already loaded)
+  // browser-manager pre-navigated the default page via CDP during pool warmup.
+  // Playwright's connectOverCDP sees that page via contexts()[0].pages()[0].
+  console.log(`📦 Acquiring browser context (v1.1.3F2: reuse pre-navigated page)...`);
 
-  // Issue 7b: Wrap browser operations in try-catch for TargetClosedError
   let context, page;
   try {
-    context = await browser!.newContext();
-    page = await context.newPage();
+    const contexts = browser!.contexts();
+    context = contexts[0]; // Default context from connectOverCDP
+    const existingPages = context.pages();
+    if (existingPages.length > 0) {
+      page = existingPages[0];
+      console.log(`✅ Browser instance ready (reusing pre-navigated page at ${page.url()})`);
+    } else {
+      page = await context.newPage();
+      console.log(`✅ Browser instance ready (fresh page, no pre-nav available)`);
+    }
   } catch (error: any) {
     if (error.name === 'TargetClosedError' || error.message?.includes('Target closed')) {
-      console.error(`⚠️ Browser closed during context creation for ${sessionId}`);
+      console.error(`⚠️ Browser closed during context setup for ${sessionId}`);
       throw new Error('BROWSER_DISCONNECTED');
     }
     throw error;
   }
-  console.log(`✅ Browser instance ready with fresh context`);
 
   // z-4 Phase 2b: Verify relay is configured
   try {
@@ -605,13 +612,14 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 
         const authPage = browserInstance.page;
 
-        // v3-v: Navigate to QR login page (moved from browser-manager)
-        // We always navigate since we created a fresh page
-        console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
+        // v1.1.3F2: Navigate from pre-loaded tiktok.com → /login/qrcode (same-origin, fast)
+        const navStart = Date.now();
+        console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}... (from ${authPage.url()})`);
         await authPage.goto('https://www.tiktok.com/login/qrcode', {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
+        console.log(`⏱️ QR page loaded in ${Date.now() - navStart}ms for ${authSessionId.substring(0, 8)}...`);
 
         // Wait for QR code with diagnostics on failure
         try {

@@ -211,6 +211,9 @@ class BrowserManager {
       await this.configureContainerProxy(containerInfo);
       console.log(`✅ Container ${containerId.substring(0, 16)}... proxy pre-configured`);
 
+      // v1.1.3F2: Pre-navigate to TikTok to cache assets for fast QR auth
+      await this.preNavigateToTikTok(containerInfo);
+
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
 
@@ -336,6 +339,57 @@ class BrowserManager {
     }
 
     console.log(logMessage);
+  }
+
+  /**
+   * v1.1.3F2: Pre-navigate default page to tiktok.com during pool warmup.
+   * When Playwright later connects via connectOverCDP, it sees this page already loaded
+   * with TikTok assets cached. Navigating from tiktok.com → /login/qrcode is ~3-7s
+   * instead of cold-start ~25-30s.
+   */
+  private async preNavigateToTikTok(containerInfo: ContainerInfo): Promise<void> {
+    try {
+      const listUrl = `http://${containerInfo.ip}:9223/json/list`;
+      const listResp = await fetch(listUrl);
+      if (!listResp.ok) {
+        console.log(`⚠️ Pre-nav: couldn't list targets for ${containerInfo.containerId.substring(0, 16)}`);
+        return;
+      }
+      const targets = await listResp.json();
+      const page = targets.find((t: any) => t.type === 'page');
+      if (!page) {
+        console.log(`⚠️ Pre-nav: no page target found`);
+        return;
+      }
+
+      const WebSocket = (await import('ws')).default;
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => { ws.close(); reject(new Error('Pre-nav timeout')); }, 20000);
+        ws.on('open', () => {
+          ws.send(JSON.stringify({
+            id: 1,
+            method: 'Page.navigate',
+            params: { url: 'https://www.tiktok.com' }
+          }));
+        });
+        ws.on('message', (data: any) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === 1) {
+            clearTimeout(timeout);
+            // Wait 5s for page assets to load before closing CDP connection
+            setTimeout(() => { ws.close(); resolve(); }, 5000);
+          }
+        });
+        ws.on('error', (err: any) => { clearTimeout(timeout); reject(err); });
+      });
+
+      console.log(`✅ Pre-nav: ${containerInfo.containerId.substring(0, 16)}... loaded tiktok.com`);
+    } catch (error: any) {
+      console.log(`⚠️ Pre-nav failed for ${containerInfo.containerId.substring(0, 16)}...: ${error.message}`);
+      // Non-fatal — container still usable, just slower first navigation
+    }
   }
 
   async releaseContainer(sessionId: string): Promise<void> {
