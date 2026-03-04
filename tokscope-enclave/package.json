@@ -17,12 +17,14 @@
     "@typescript-eslint/parser": "8.44.0",
     "jsqr": "1.4.0",
     "jimp": "1.6.0",
-    "socks-proxy-agent": "8.0.5"
+    "socks-proxy-agent": "8.0.5",
+    "ws": "8.18.3"
   },
   "devDependencies": {
     "typescript": "5.6.2",
     "@types/node": "20.16.5",
-    "@types/express": "4.17.21"
+    "@types/express": "4.17.21",
+    "@types/ws": "8.5.13"
   },
   "engines": {
     "node": ">=18"

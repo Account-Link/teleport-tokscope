@@ -362,46 +362,27 @@ class BrowserManager {
         return;
       }
 
-      // Use Node built-in http to do WebSocket upgrade (avoids ws dependency)
-      const http = await import('http');
-      const url = new URL(page.webSocketDebuggerUrl);
+      const WebSocket = (await import('ws')).default;
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
 
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => { reject(new Error('Pre-nav timeout')); }, 20000);
-        const req = http.get({
-          hostname: url.hostname,
-          port: url.port,
-          path: url.pathname,
-          headers: {
-            'Connection': 'Upgrade',
-            'Upgrade': 'websocket',
-            'Sec-WebSocket-Version': '13',
-            'Sec-WebSocket-Key': Buffer.from(Math.random().toString()).toString('base64'),
-          }
-        });
-        req.on('upgrade', (_res: any, socket: any) => {
-          // Send CDP Page.navigate command as WebSocket text frame
-          const payload = JSON.stringify({
+        const timeout = setTimeout(() => { ws.close(); reject(new Error('Pre-nav timeout')); }, 20000);
+        ws.on('open', () => {
+          ws.send(JSON.stringify({
             id: 1,
             method: 'Page.navigate',
             params: { url: 'https://www.tiktok.com' }
-          });
-          // WebSocket text frame: 0x81 + length + payload
-          const buf = Buffer.from(payload);
-          const frame = Buffer.alloc(2 + buf.length);
-          frame[0] = 0x81; // FIN + text opcode
-          frame[1] = buf.length; // No mask (server->client style, CDP accepts this)
-          buf.copy(frame, 2);
-          socket.write(frame);
-
-          // Wait for response then allow 5s for assets to load
-          socket.once('data', () => {
-            clearTimeout(timeout);
-            setTimeout(() => { socket.destroy(); resolve(); }, 5000);
-          });
-          socket.on('error', () => { clearTimeout(timeout); socket.destroy(); resolve(); });
+          }));
         });
-        req.on('error', (err: any) => { clearTimeout(timeout); reject(err); });
+        ws.on('message', (data: any) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === 1) {
+            clearTimeout(timeout);
+            // Wait 5s for page assets to load before closing CDP connection
+            setTimeout(() => { ws.close(); resolve(); }, 5000);
+          }
+        });
+        ws.on('error', (err: any) => { clearTimeout(timeout); reject(err); });
       });
 
       console.log(`✅ Pre-nav: ${containerInfo.containerId.substring(0, 16)}... loaded tiktok.com`);
