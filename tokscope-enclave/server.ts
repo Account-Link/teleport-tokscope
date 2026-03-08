@@ -29,6 +29,38 @@ process.on('uncaughtException', (error: Error) => {
 
 const BROWSER_MANAGER_URL = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
 
+function toTraceCode(value: unknown): string {
+  const raw = String(value || 'unknown');
+  const normalized = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return normalized || 'unknown';
+}
+
+function formatTraceValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return encodeURIComponent(String(value));
+}
+
+function logAuthTrace(authSessionId: string, event: string, fields: Record<string, unknown> = {}): void {
+  const payload = Object.entries({
+    authSessionId,
+    event,
+    ts_ms: Date.now(),
+    ...fields,
+  })
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${key}=${formatTraceValue(value)}`)
+    .join(' ');
+  console.log(`AUTH_TRACE ${payload}`);
+}
+
 interface SessionData {
   user?: {
     sec_user_id?: string;
@@ -236,36 +268,68 @@ class AuthSessionManager {
  */
 async function requestBrowserInstance(sessionId: string): Promise<BrowserInstance> {
   console.log(`🔄 Requesting browser instance from ${BROWSER_MANAGER_URL}/assign/${sessionId}`);
+  logAuthTrace(sessionId, 'assign_request_started', {
+    browser_manager_url: BROWSER_MANAGER_URL,
+  });
   const response = await fetch(`${BROWSER_MANAGER_URL}/assign/${sessionId}`, {
     method: 'POST'
   });
   console.log(`🔄 Browser manager response status: ${response.status}`);
+  logAuthTrace(sessionId, 'assign_response_received', {
+    status_code: response.status,
+  });
   if (!response.ok) {
+    logAuthTrace(sessionId, 'assign_request_failed', {
+      status_code: response.status,
+      error_code: `assign_http_${response.status}`,
+    });
     throw new Error(`Failed to get browser instance: ${response.statusText}`);
   }
   const result = await response.json();
   console.log(`🔄 Container assigned: ${result.container.containerId?.substring(0, 20)}... (IP: ${result.container.ip})`);
 
+  logAuthTrace(sessionId, 'container_assigned', {
+    container_id: result.container.containerId,
+    container_ip: result.container.ip,
+    cdp_url: result.container.cdpUrl,
+  });
+
   // v3-v: Connect via CDP - THIS IS THE ONLY CONNECTION
   // browser-manager no longer creates a CDP connection
   let browser = null;
   const maxRetries = 3;
+  const cdpConnectStartedAt = Date.now();
+  logAuthTrace(sessionId, 'cdp_connect_started', {
+    container_id: result.container.containerId,
+  });
   for (let i = 0; i < maxRetries; i++) {
     try {
       browser = await chromium.connectOverCDP(result.container.cdpUrl);
       break;
     } catch (error) {
+      logAuthTrace(sessionId, 'cdp_connect_retry', {
+        attempt: i + 1,
+        container_id: result.container.containerId,
+      });
       if (i === maxRetries - 1) throw error;
       console.log(`🔄 CDP connection attempt ${i + 1}/${maxRetries} failed, retrying...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
+  logAuthTrace(sessionId, 'cdp_connect_done', {
+    container_id: result.container.containerId,
+    cdp_connect_ms: Math.max(0, Date.now() - cdpConnectStartedAt),
+  });
 
   // v3-v: Create OUR context - cookies will be in THIS context
   // This is the key fix: same connection owns context = cookies visible
   console.log(`📦 Creating browser context (Solution F: single CDP owner)...`);
 
   // Issue 7b: Wrap browser operations in try-catch for TargetClosedError
+  const contextCreateStartedAt = Date.now();
+  logAuthTrace(sessionId, 'browser_context_create_started', {
+    container_id: result.container.containerId,
+  });
   let context, page;
   try {
     context = await browser!.newContext();
@@ -278,6 +342,11 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     throw error;
   }
   console.log(`✅ Browser instance ready with fresh context`);
+
+  logAuthTrace(sessionId, 'browser_context_ready', {
+    container_id: result.container.containerId,
+    browser_context_create_ms: Math.max(0, Date.now() - contextCreateStartedAt),
+  });
 
   // z-4 Phase 2b: Verify relay is configured
   try {
@@ -357,6 +426,7 @@ async function releaseBrowserInstance(sessionId: string): Promise<void> {
  */
 async function destroyAuthContainer(sessionId: string): Promise<void> {
   try {
+    logAuthTrace(sessionId, 'container_recycle_requested');
     const response = await fetch(`${BROWSER_MANAGER_URL}/recycle/${sessionId}`, {
       method: 'POST'
     });
@@ -592,7 +662,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
     const authSessionId = authSessionManager.createAuthSession(sessionId);
     const startSession = authSessionManager.getAuthSession(authSessionId);
     const qrRequestedAt = startSession?.qrRequestedAt || startSession?.startedAt || Date.now();
-    console.log(`AUTH_TRACE authSessionId=${authSessionId} event=qr_requested qr_requested_at_ms=${qrRequestedAt}`);
+    logAuthTrace(authSessionId, 'qr_requested', {
+      qr_requested_at_ms: qrRequestedAt,
+    });
 
 
     // Start authentication flow asynchronously
@@ -615,13 +687,22 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // v3-v: Navigate to QR login page (moved from browser-manager)
         // We always navigate since we created a fresh page
         console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}...`);
+        const qrNavigationStartedAt = Date.now();
+        logAuthTrace(authSessionId, 'qr_navigation_started', {
+          url: 'https://www.tiktok.com/login/qrcode',
+        });
         await authPage.goto('https://www.tiktok.com/login/qrcode', {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
+        logAuthTrace(authSessionId, 'qr_navigation_done', {
+          qr_navigation_ms: Math.max(0, Date.now() - qrNavigationStartedAt),
+          current_url: authPage.url().split('?')[0],
+        });
 
         // Wait for QR code with diagnostics on failure
         try {
+          logAuthTrace(authSessionId, 'qr_wait_visible_started');
           await authPage.waitForSelector('img[alt="qrcode"]', {
             timeout: 15000,  // z-5a: increased from 10s to 15s
             state: 'visible'
@@ -634,7 +715,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
             qrVisibleAt: now
           });
           console.log(`✅ QR code visible for auth ${authSessionId.substring(0, 8)}...`);
-          console.log(`AUTH_TRACE authSessionId=${authSessionId} event=qr_visible tee_qr_page_open_ms=${tee_qr_page_open_ms}`);
+          logAuthTrace(authSessionId, 'qr_visible', {
+            tee_qr_page_open_ms,
+          });
           // Capture screenshot when QR is visible (for debugging)
           await captureDebugScreenshot(authPage, authSessionId, 'qr_visible');
         } catch (qrWaitError) {
@@ -671,6 +754,11 @@ app.post('/auth/start/:sessionId', async (req, res) => {
             console.error(`   Blocker: [UNKNOWN]`);
           }
           console.error(`   Body preview: ${pageState.bodyText.replace(/\n/g, ' ').substring(0, 200)}`);
+          logAuthTrace(authSessionId, 'qr_wait_visible_failed', {
+            blocker: pageState.hasCaptcha ? 'tiktok_captcha' : (pageState.hasRecaptcha ? 'recaptcha' : 'unknown'),
+            current_url: truncatedUrl,
+            page_title: truncatedTitle,
+          });
 
           // Capture screenshot before cleanup
           await captureDebugScreenshot(authPage, authSessionId, 'qr_not_visible');
@@ -684,10 +772,20 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
 
         // Extract and decode QR code
+        const qrExtractStartedAt = Date.now();
+        logAuthTrace(authSessionId, 'qr_extract_started');
         const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
+        const qrExtractedAt = Date.now();
         authSessionManager.updateAuthSession(authSessionId, {
           qrCodeData: qrData.image,
-          qrDecodedUrl: qrData.decodedUrl
+          qrDecodedUrl: qrData.decodedUrl,
+          qrExtractedAt
+        });
+        logAuthTrace(authSessionId, 'qr_extract_done', {
+          tee_qr_extract_ms: Math.max(0, qrExtractedAt - qrExtractStartedAt),
+          qr_image_bytes: qrData.image?.length || 0,
+          qr_url_present: !!qrData.decodedUrl,
+          qr_extract_warning: qrData.error ? toTraceCode(qrData.error) : undefined,
         });
 
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
@@ -704,6 +802,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 
       } catch (error: any) {
         console.error(`❌ Auth flow error for ${authSessionId}:`, error.message);
+        logAuthTrace(authSessionId, 'auth_flow_error', {
+          error_code: toTraceCode(error?.message || error),
+        });
         authSessionManager.updateAuthSession(authSessionId, {
           status: 'failed'
         });
@@ -734,6 +835,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 async function waitForLoginCompletion(authSessionId: string, page: Page, preAuthToken?: string): Promise<void> {
   const timeout = 120000; // 2 minutes
   const startTime = Date.now();
+  logAuthTrace(authSessionId, 'login_wait_started', {
+    login_wait_timeout_ms: timeout,
+  });
 
   // v3-o: Track state for diagnostics
   const seenUrls = new Set<string>();
@@ -818,6 +922,10 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       // 2. Early CAPTCHA detection - fail fast, don't wait 2 minutes
       if (baseUrl.includes('google.com') || baseUrl.includes('captcha') || baseUrl.includes('recaptcha')) {
         console.error(`🚫 Auth ${authSessionId.substring(0, 8)} CAPTCHA detected - aborting`);
+        logAuthTrace(authSessionId, 'login_wait_aborted', {
+          reason: 'captcha_redirect',
+          current_url: baseUrl,
+        });
         authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
         await destroyAuthContainer(authSessionId);
         return;
@@ -854,6 +962,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
             console.warn(`⚠️ Auth ${authSessionId.substring(0, 8)} [${warning}] at ${elapsed}s`);
             console.warn(`   URL: ${baseUrl}`);
 
+            logAuthTrace(authSessionId, 'warning_detected', {
+              warning,
+              elapsed_ms: Math.max(0, Date.now() - startTime),
+              current_url: baseUrl,
+            });
             // v3-s: Capture screenshot on first warning occurrence
             await captureDebugScreenshot(page, authSessionId, `warning_${warning.toLowerCase()}`);
           }
@@ -867,6 +980,14 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           }
         }
 
+        for (const warning of lastWarnings) {
+          if (!currentWarnings.has(warning)) {
+            logAuthTrace(authSessionId, 'warning_cleared', {
+              warning,
+              elapsed_ms: Math.max(0, Date.now() - startTime),
+            });
+          }
+        }
         lastWarnings = currentWarnings;
       }
 
@@ -884,7 +1005,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         authSessionManager!.updateAuthSession(authSessionId, {
           loginDetectedAt
         });
-        console.log(`AUTH_TRACE authSessionId=${authSessionId} event=login_detected tee_wait_for_scan_ms=${tee_wait_for_scan_ms}`);
+        logAuthTrace(authSessionId, 'login_detected', {
+          detection: 'url',
+          tee_wait_for_scan_ms,
+          current_url: fullUrlForDetection.split('?')[0],
+        });
 
         // Extract session data
         const sessionData = await extractAuthData(page);
@@ -917,6 +1042,19 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       // 6b. SECONDARY: Cookie-based detection (sessionid sufficient, like Nov 13 version)
       if (arrivedCookies.has('sessionid')) {
         console.log(`✅ Auth ${authSessionId.substring(0, 8)} login successful (sessionid cookie detected)`);
+
+        const loginDetectedAt = Date.now();
+        const session = authSessionManager!.getAuthSession(authSessionId);
+        const qrExtractedAt = session?.qrExtractedAt || session?.qrVisibleAt || session?.qrRequestedAt || startTime;
+        const tee_wait_for_scan_ms = Math.max(0, loginDetectedAt - qrExtractedAt);
+        authSessionManager!.updateAuthSession(authSessionId, {
+          loginDetectedAt
+        });
+        logAuthTrace(authSessionId, 'login_detected', {
+          detection: 'cookie',
+          tee_wait_for_scan_ms,
+          arrived_cookie_count: arrivedCookies.size,
+        });
 
         // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
@@ -962,6 +1100,9 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       // 7. Log errors instead of silent swallow
       console.warn(`⚠️ Auth ${authSessionId.substring(0, 8)} poll error: ${error.message}`);
 
+      logAuthTrace(authSessionId, 'login_poll_error', {
+        error_code: toTraceCode(error?.message || error),
+      });
       // v3-t: Break if browser died, delay on other errors
       if (error.message.includes('closed')) break;
       await new Promise(r => setTimeout(r, 1000));
@@ -976,6 +1117,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
     const missing = requiredCookies.filter(name => !arrivedCookies.has(name));
     console.log(`   Missing: [${missing.join(', ')}]`);
   }
+  logAuthTrace(authSessionId, 'login_timeout', {
+    elapsed_ms: Math.max(0, Date.now() - startTime),
+    arrived_cookie_count: arrivedCookies.size,
+    final_url: page.url().split('?')[0],
+  });
 
   // v3-s: Capture screenshot at timeout to see final page state
   await captureDebugScreenshot(page, authSessionId, 'timeout_no_cookies');
@@ -995,6 +1141,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
  */
 async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken: string, authSessionId: string): Promise<void> {
   const storeStart = Date.now();
+  logAuthTrace(authSessionId, 'store_user_started');
   try {
     if (authSessionManager) {
       authSessionManager.updateAuthSession(authSessionId, {
@@ -1042,11 +1189,17 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
     }
 
     const secUserId = storeResponse.data.sec_user_id;
+    logAuthTrace(authSessionId, 'store_user_uploaded', {
+      sec_user_id: secUserId,
+    });
     console.log(`✅ User stored in Xordi: ${secUserId} (trust_level=0, encrypted cookies)`);
 
     // Phase 3: Escalate trust level after verification
     console.log('🔼 Escalating trust level...');
 
+    logAuthTrace(authSessionId, 'trust_escalation_started', {
+      sec_user_id: secUserId,
+    });
     // Issue 6: Wrap escalate-trust in separate try-catch (don't re-throw)
     try {
       const escalateResponse = await axios.post(
@@ -1066,6 +1219,10 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
 
       if (!escalateResponse.data.success) {
         console.warn('⚠️ Trust escalation failed, user remains at trust_level=0');
+        logAuthTrace(authSessionId, 'trust_escalation_result', {
+          sec_user_id: secUserId,
+          result: 'not_elevated',
+        });
       } else {
         console.log(`✅ Trust escalated: ${secUserId} → trust_level=2 (verified)`);
       }
@@ -1091,14 +1248,18 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
       authSessionManager.updateAuthSession(authSessionId, {
         storeUserDoneAt: storeDone,
       });
-      console.log(
-        `AUTH_TRACE authSessionId=${authSessionId} event=store_user_done tee_store_user_ms=${tee_store_user_ms} tee_total_auth_ms=${tee_total_auth_ms}`
-      );
+      logAuthTrace(authSessionId, 'store_user_done', {
+        tee_store_user_ms,
+        tee_total_auth_ms,
+      });
     }
 
   } catch (error: any) {
 
     console.error('❌ TEE encryption/storage failed:', error.message);
+    logAuthTrace(authSessionId, 'store_user_failed', {
+      error_code: toTraceCode(error?.message || error),
+    });
     throw error;
   }
 }

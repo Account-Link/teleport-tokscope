@@ -8,6 +8,42 @@ import * as fs from 'fs';
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
 
+function formatTraceValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return encodeURIComponent(String(value));
+}
+
+function logBmTrace(sessionId: string, event: string, fields: Record<string, unknown> = {}): void {
+  const payload = Object.entries({
+    sessionId,
+    event,
+    ts_ms: Date.now(),
+    ...fields,
+  })
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${key}=${formatTraceValue(value)}`)
+    .join(' ');
+  console.log(`BM_TRACE ${payload}`);
+}
+
+function logBmContainerTrace(containerId: string, event: string, fields: Record<string, unknown> = {}): void {
+  const payload = Object.entries({
+    containerId,
+    event,
+    ts_ms: Date.now(),
+    ...fields,
+  })
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${key}=${formatTraceValue(value)}`)
+    .join(' ');
+  console.log(`BM_CONTAINER_TRACE ${payload}`);
+}
+
 interface Config {
   tcb: {
     container_idle_timeout_ms: number;
@@ -90,6 +126,9 @@ class BrowserManager {
     const containerId = this.generateContainerId();
     const network = process.env.DOCKER_NETWORK || 'xordi-proprietary-modules_enclave-api-network';
     const subnet = process.env.DOCKER_SUBNET || '172.19.0.0/16';
+    logBmContainerTrace(containerId, 'create_started', {
+      network,
+    });
 
     try {
       console.log(`🚀 Creating browser container: ${containerId}`);
@@ -155,6 +194,9 @@ class BrowserManager {
       const { stdout: runResult } = await execAsync(dockerCmd.join(' '));
       const result = runResult.trim();
       const shortContainerId = result.substring(0, 12);
+      logBmContainerTrace(containerId, 'docker_run_done', {
+        short_id: shortContainerId,
+      });
 
       console.log(`⏳ Waiting for container ${containerId} to be ready...`);
       let retries = 0;
@@ -170,6 +212,7 @@ class BrowserManager {
           }
 
           await execAsync(`docker exec ${containerId} supervisorctl status neko`);
+          logBmContainerTrace(containerId, 'neko_ready');
           console.log(`📺 Container ${containerId} neko service is ready`);
           break;
         } catch {
@@ -191,6 +234,9 @@ class BrowserManager {
       // tokscope-enclave (server.ts) will create the single CDP connection
       const cdpUrl = `http://${containerIP}:9223`;
       await this.waitForBrowserReady(containerIP);
+      logBmContainerTrace(containerId, 'browser_ready', {
+        container_ip: containerIP,
+      });
 
       // v3-v: Simplified ContainerInfo - no browser/context/page
       const containerInfo: ContainerInfo = {
@@ -209,10 +255,14 @@ class BrowserManager {
       // z-1: Pre-configure proxy at creation time (not assignment)
       // Proxy uses global credentials + random bucket - no per-session info needed
       await this.configureContainerProxy(containerInfo);
+      logBmContainerTrace(containerId, 'proxy_preconfigured');
       console.log(`✅ Container ${containerId.substring(0, 16)}... proxy pre-configured`);
 
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
+      logBmContainerTrace(containerId, 'pool_ready', {
+        pool_size: this.containerPool.length,
+      });
 
       console.log(`✅ Browser container ready: ${containerId.substring(0, 16)}... (${containerIP})`);
       return containerId;
@@ -220,6 +270,9 @@ class BrowserManager {
     } catch (error: any) {
       console.error(`❌ Failed to create container ${containerId}:`, error.message);
 
+      logBmContainerTrace(containerId, 'create_failed', {
+        error: error.message,
+      });
       await execAsync(`docker rm -f ${containerId}`).catch(() => {});
 
       throw error;
@@ -230,6 +283,9 @@ class BrowserManager {
     if (!this.isInitialized) {
       throw new Error('Browser Manager not initialized');
     }
+    logBmTrace(sessionId, 'assign_requested', {
+      pool_size_before: this.containerPool.length,
+    });
 
     if (this.sessionToContainer.has(sessionId)) {
       const existingContainerId = this.sessionToContainer.get(sessionId)!;
@@ -238,6 +294,9 @@ class BrowserManager {
       if (containerInfo && containerInfo.status === 'assigned') {
         console.log(`♻️  Reusing existing container for session ${sessionId.substring(0, 8)}...`);
         containerInfo.lastUsed = Date.now();
+        logBmTrace(sessionId, 'assign_reused', {
+          container_id: existingContainerId,
+        });
         return containerInfo;
       }
     }
@@ -247,6 +306,9 @@ class BrowserManager {
     if (!containerId) {
       // Pool exhausted = at capacity. Don't create more containers.
       // Let the request fail so auto-scaler can spin up a new machine.
+      logBmTrace(sessionId, 'assign_failed_capacity', {
+        pool_size_before: this.containerPool.length,
+      });
       throw new Error('No available containers - capacity reached');
     }
 
@@ -265,6 +327,14 @@ class BrowserManager {
     // v3-v: NO navigation here - server.ts owns CDP and will navigate
     console.log(`✅ Container ${containerId.substring(0, 16)}... assigned (pre-configured, awaiting CDP from server.ts)`);
 
+    logBmTrace(sessionId, 'assign_success', {
+      container_id: containerId,
+      pool_size_after: this.containerPool.length,
+    });
+    logBmContainerTrace(containerId, 'assigned', {
+      session_id: sessionId,
+      pool_size_after: this.containerPool.length,
+    });
     return containerInfo;
   }
 
@@ -338,8 +408,10 @@ class BrowserManager {
   }
 
   async releaseContainer(sessionId: string): Promise<void> {
+    logBmTrace(sessionId, 'release_requested');
     if (!this.sessionToContainer.has(sessionId)) {
       console.log(`⚠️  No container assigned to session ${sessionId.substring(0, 8)}...`);
+      logBmTrace(sessionId, 'release_skipped_missing');
       return;
     }
 
@@ -355,6 +427,12 @@ class BrowserManager {
       console.log(`🔓 Released container ${containerId.substring(0, 16)}... from session ${sessionId.substring(0, 8)}... (will be cleaned up)`);
     }
 
+    logBmTrace(sessionId, 'release_done', {
+      container_id: containerId,
+    });
+    logBmContainerTrace(containerId, 'released', {
+      session_id: sessionId,
+    });
     this.sessionToContainer.delete(sessionId);
   }
 
@@ -363,9 +441,13 @@ class BrowserManager {
    * Pool maintenance will create fresh containers to maintain MIN_POOL_SIZE
    */
   async recycleContainer(sessionId: string): Promise<void> {
+    logBmTrace(sessionId, 'recycle_requested');
     const containerId = this.sessionToContainer.get(sessionId);
     if (containerId) {
       console.log(`🗑️ Destroying auth container for session ${sessionId.substring(0, 8)}...`);
+      logBmContainerTrace(containerId, 'recycle_requested', {
+        session_id: sessionId,
+      });
       await this.destroyContainer(containerId);
       this.sessionToContainer.delete(sessionId);
     } else {
@@ -381,6 +463,10 @@ class BrowserManager {
     }
 
     console.log(`🗑️  Destroying container: ${containerId.substring(0, 16)}...`);
+
+    logBmContainerTrace(containerId, 'destroy_started', {
+      session_id: containerInfo.sessionId || undefined,
+    });
 
     // v3-v: No browser.close() - we don't own the CDP connection
     // server.ts owns the connection and is responsible for cleanup
@@ -401,6 +487,7 @@ class BrowserManager {
     }
 
     this.containers.delete(containerId);
+    logBmContainerTrace(containerId, 'destroy_done');
   }
 
   private startCleanupInterval(): void {
