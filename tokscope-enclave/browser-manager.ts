@@ -4,6 +4,7 @@ const execAsync = promisify(exec);
 // v3-v: Removed Playwright - browser-manager is Docker lifecycle only
 // tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
+import { log } from './lib/log';
 
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
@@ -83,6 +84,7 @@ class BrowserManager {
         await new Promise(r => setTimeout(r, 2000));
       }
     }
+    log.warn('BROWSER', 'browser_ready_timeout', { id: ip.substring(0, 12), elapsed_ms: maxRetries * 2000, attempts: maxRetries });
     throw new Error('Browser failed to become ready within timeout');
   }
 
@@ -101,7 +103,7 @@ class BrowserManager {
           console.log(`📡 Creating network: ${network}`);
           await execAsync(`docker network create --driver bridge --subnet ${subnet} ${network}`);
         } catch (error) {
-          console.log(`⚠️  Network ${network} creation failed, assuming it exists`);
+          log.warn('BROWSER', 'network_create_failed', { network: network, error: (error as any).message });
         }
       }
 
@@ -217,11 +219,12 @@ class BrowserManager {
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
 
-      console.log(`✅ Browser container ready: ${containerId.substring(0, 16)}... (${containerIP})`);
+      const createDuration = Date.now() - containerInfo.createdAt;
+      log.ok('BROWSER', 'container_created', { id: shortContainerId, pool_size: this.containerPool.length, duration: `${createDuration}ms` });
       return containerId;
 
     } catch (error: any) {
-      console.error(`❌ Failed to create container ${containerId}:`, error.message);
+      log.fail('BROWSER', 'container_failed', { error: error.message, pool_size: this.containerPool.length });
 
       await execAsync(`docker rm -f ${containerId}`).catch(() => {});
 
@@ -420,7 +423,9 @@ class BrowserManager {
   async recycleContainer(sessionId: string): Promise<void> {
     const containerId = this.sessionToContainer.get(sessionId);
     if (containerId) {
-      console.log(`🗑️ Destroying auth container for session ${sessionId.substring(0, 8)}...`);
+      const containerInfo = this.containers.get(containerId);
+      const reuseCount = containerInfo ? 1 : 0; // containers are not reused, destroyed after each auth
+      log.ok('BROWSER', 'container_recycled', { id: containerId.substring(0, 12), reuse_count: reuseCount });
       await this.destroyContainer(containerId);
       this.sessionToContainer.delete(sessionId);
     } else {
@@ -435,7 +440,7 @@ class BrowserManager {
       return;
     }
 
-    console.log(`🗑️  Destroying container: ${containerId.substring(0, 16)}...`);
+    log.ok('BROWSER', 'container_destroyed', { id: containerId.substring(0, 12), reason: containerInfo.status });
 
     // v3-v: No browser.close() - we don't own the CDP connection
     // server.ts owns the connection and is responsible for cleanup
@@ -468,6 +473,7 @@ class BrowserManager {
       for (const [containerId, containerInfo] of this.containers.entries()) {
         // Only destroy 'released' containers (used and returned), NOT 'pooled' (warm pool)
         if (containerInfo.status === 'released' && now - containerInfo.lastUsed > timeoutMs) {
+          log.ok('BROWSER', 'container_timeout', { id: containerId.substring(0, 12), idle_duration: `${Math.round((now - containerInfo.lastUsed) / 1000)}s` });
           toDestroy.push(containerId);
         }
       }
@@ -536,6 +542,12 @@ class BrowserManager {
     }, CHECK_INTERVAL_MS);
 
     console.log(`🔧 Pool maintenance started (min size: ${MIN_POOL_SIZE}, check every ${CHECK_INTERVAL_MS / 1000}s)`);
+
+    // Pool status heartbeat every 5 minutes
+    setInterval(() => {
+      const stats = this.getStats();
+      log.ok('BROWSER', 'pool_status', { total: stats.total, idle: stats.available, in_use: stats.assigned, creating: 0 });
+    }, 5 * 60 * 1000);
   }
 
   private cleanupAllOrphanedContainers(): void {

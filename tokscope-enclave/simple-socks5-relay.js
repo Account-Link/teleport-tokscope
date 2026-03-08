@@ -1,5 +1,6 @@
 const net = require('net');
 const http = require('http');
+const { log } = require('./lib/log');
 
 const SOCKS_PORT = 1080;
 const CONTROL_PORT = 1081;
@@ -30,9 +31,12 @@ function connectUpstream(targetHost, targetPort, callback) {
   }
 
   const socket = net.connect(upstreamConfig.port, upstreamConfig.host);
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15000);
   let step = 0;
 
   socket.once('error', (err) => {
+    log.error('RELAY', 'upstream_unreachable', { host: upstreamConfig.host, port: upstreamConfig.port, error: err.message });
     callback(err);
     socket.destroy();
   });
@@ -56,6 +60,7 @@ function connectUpstream(targetHost, targetPort, callback) {
         ]));
         step = 1;
       } else {
+        log.warn('RELAY', 'socks_handshake_failed', { stage: 'auth_method', code: data[1] });
         callback(new Error('Auth method not supported'));
         socket.destroy();
       }
@@ -70,6 +75,7 @@ function connectUpstream(targetHost, targetPort, callback) {
         ]));
         step = 2;
       } else {
+        log.warn('RELAY', 'socks_handshake_failed', { stage: 'auth', code: data[1] });
         callback(new Error('Auth failed'));
         socket.destroy();
       }
@@ -77,6 +83,7 @@ function connectUpstream(targetHost, targetPort, callback) {
       if (data[0] === 0x05 && data[1] === 0x00) {
         callback(null, socket);
       } else {
+        log.warn('RELAY', 'socks_handshake_failed', { stage: 'connect', code: data[1] });
         callback(new Error('Connect failed'));
         socket.destroy();
       }
@@ -154,7 +161,7 @@ const controlServer = http.createServer((req, res) => {
           user: cfg.user,
           pass: cfg.pass
         };
-        console.log(`[relay] Configured: ${upstreamConfig.host}:${upstreamConfig.port}`);
+        log.ok('RELAY', 'relay_configured', { host: upstreamConfig.host, port: upstreamConfig.port });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, mode: 'proxied' }));
       } catch (e) {

@@ -7,6 +7,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
+const { log } = require('./lib/log');
 
 class PythonSecurityModule {
   constructor() {
@@ -64,7 +65,7 @@ class PythonSecurityModule {
 
     // Handle process exit
     this.pythonProcess.on('exit', (code) => {
-      console.error(`Python subprocess exited with code ${code}`);
+      log.error('SECURITY', 'subprocess_exited', { code: code, pending_requests: this.pendingRequests.size });
       this.isReady = false;
 
       // Reject all pending requests
@@ -101,9 +102,11 @@ class PythonSecurityModule {
       this.pythonProcess.stdin.write(JSON.stringify(request) + '\n');
 
       // Timeout after 30 seconds
+      const timeoutStart = Date.now();
       setTimeout(() => {
         if (this.pendingRequests.has(requestId)) {
           this.pendingRequests.delete(requestId);
+          log.warn('SECURITY', 'request_timeout', { action: action, elapsed_ms: Date.now() - timeoutStart });
           reject(new Error('Request timeout'));
         }
       }, 30000);

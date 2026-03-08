@@ -10,6 +10,7 @@
  */
 
 const crypto = require('crypto');
+const { log } = require('./lib/log');
 
 const FALLBACK_KEY_MATERIAL = process.env.FALLBACK_KEY_MATERIAL || 'tee-enclave-key-material-32chars';
 
@@ -19,7 +20,7 @@ class TEECrypto {
     const keyMaterial = process.env.TEE_ENCRYPTION_KEY || FALLBACK_KEY_MATERIAL;
     this.encryptionKey = crypto.createHash('sha256').update(keyMaterial).digest();
     this._usingDStackKey = false;
-    console.log('🔐 TEE crypto initialized with fallback key (awaiting DStack)');
+    log.warn('TEE', 'tee_key_fallback', { reason: 'awaiting_dstack' });
   }
 
   /**
@@ -29,7 +30,7 @@ class TEECrypto {
   setDStackKey(derivedKeyBuffer) {
     this.encryptionKey = derivedKeyBuffer;
     this._usingDStackKey = true;
-    console.log('🔐 TEE crypto upgraded to DStack-derived key');
+    log.ok('TEE', 'tee_key_derived', { method: 'dstack' });
   }
 
   /**
@@ -57,9 +58,11 @@ class TEECrypto {
 
       // Wire format: IV (12) + AuthTag (16) + Ciphertext
       const combined = Buffer.concat([iv, authTag, encrypted]);
-      return combined.toString('hex');
+      const result = combined.toString('hex');
+      log.ok('TEE', 'encrypt_ok', {});
+      return result;
     } catch (error) {
-      console.error('Cookie encryption failed:', error);
+      log.error('TEE', 'encrypt_fail', { error: error.message });
       throw new Error('TEE encryption failed');
     }
   }
@@ -82,9 +85,11 @@ class TEECrypto {
       let decrypted = decipher.update(encrypted);
       decrypted = Buffer.concat([decrypted, decipher.final()]);
 
-      return JSON.parse(decrypted.toString('utf8'));
+      const plaintext = JSON.parse(decrypted.toString('utf8'));
+      log.ok('TEE', 'decrypt_ok', {});
+      return plaintext;
     } catch (error) {
-      console.error('Cookie decryption failed:', error);
+      log.error('TEE', 'decrypt_fail', { error: error.message });
       throw new Error('TEE decryption failed');
     }
   }

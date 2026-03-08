@@ -3,6 +3,7 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import jsQR from 'jsqr';
+import { log } from './lib/log';
 import { Jimp } from 'jimp';
 import axios from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
@@ -198,6 +199,7 @@ class AuthSessionManager {
 
     for (const authSessionId of expired) {
       console.log(`🧹 Cleaning up expired auth session: ${authSessionId.substring(0, 8)}...`);
+      log.ok('AUTH', 'session_expired', { session: authSessionId.substring(0, 8) });
 
       // CRITICAL: Release the browser container BEFORE removing session
       try {
@@ -241,9 +243,9 @@ async function requestBrowserInstance(sessionId: string): Promise<BrowserInstanc
     try {
       browser = await chromium.connectOverCDP(result.container.cdpUrl);
       break;
-    } catch (error) {
+    } catch (error: any) {
       if (i === maxRetries - 1) throw error;
-      console.log(`🔄 CDP connection attempt ${i + 1}/${maxRetries} failed, retrying...`);
+      log.warn('AUTH', 'cdp_retry', { session: sessionId.substring(0, 8), attempt: i + 1, max_attempts: maxRetries, error: error.message });
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
@@ -591,6 +593,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
     } else {
       console.log(`🔐 Starting legacy authentication for session ${sessionId.substring(0, 8)}... (no pre-auth token)`);
     }
+    log.ok('AUTH', 'auth_started', { session: sessionId.substring(0, 8) });
 
     // Create auth session
     const authSessionId = authSessionManager.createAuthSession(sessionId);
@@ -676,12 +679,18 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
 
         // Extract and decode QR code
+        const qrNavDuration = Date.now() - navStart;
         const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
         authSessionManager.updateAuthSession(authSessionId, {
           qrCodeData: qrData.image,
           qrDecodedUrl: qrData.decodedUrl
         });
 
+        if (qrData.image) {
+          log.ok('AUTH', 'qr_generated', { session: authSessionId.substring(0, 8), duration: `${qrNavDuration}ms` });
+        } else {
+          log.fail('AUTH', 'qr_failed', { session: authSessionId.substring(0, 8), reason: qrData.error || 'no_image', duration: `${qrNavDuration}ms` });
+        }
         console.log(`✅ QR code extracted for auth ${authSessionId.substring(0, 8)}...`);
         if (qrData.decodedUrl) {
           console.log(`🔗 QR URL validated: ${qrData.decodedUrl}`);
@@ -786,8 +795,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 
     observer.observe(document.body, {
       childList: true,
-      subtree: true,
-      attributes: true
+      subtree: true
     });
   }).catch(() => {});
 
@@ -820,11 +828,16 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       const cookieNames = cookies.map(c => c.name);
 
       // 4. Progressive cookie logging - log each cookie as it arrives
+      const prevSize = arrivedCookies.size;
       for (const name of requiredCookies) {
         if (cookieNames.includes(name) && !arrivedCookies.has(name)) {
           arrivedCookies.add(name);
           console.log(`🍪 Auth ${authSessionId.substring(0, 8)} cookie: ${name} (${arrivedCookies.size}/6)`);
         }
+      }
+      // T8: Log when cookies first arrive (threshold: sessionid present = auth success)
+      if (prevSize === 0 && arrivedCookies.size > 0) {
+        log.ok('AUTH', 'cookie_arrived', { session: authSessionId.substring(0, 8), count: arrivedCookies.size, elapsed_ms: Date.now() - startTime });
       }
 
       // 5. Check for page state changes (real-time via MutationObserver)
@@ -845,6 +858,11 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
             const elapsed = Math.round((Date.now() - startTime) / 1000);
             console.warn(`⚠️ Auth ${authSessionId.substring(0, 8)} [${warning}] at ${elapsed}s`);
             console.warn(`   URL: ${baseUrl}`);
+            if (warning === 'TIKTOK_CAPTCHA' || warning === 'RECAPTCHA') {
+              log.warn('AUTH', 'captcha_detected', { session: authSessionId.substring(0, 8), elapsed: `${elapsed}s` });
+            } else if (warning === 'PHONE_VERIFY') {
+              log.warn('AUTH', 'phone_verify', { session: authSessionId.substring(0, 8) });
+            }
 
             // v3-s: Capture screenshot on first warning occurrence
             await captureDebugScreenshot(page, authSessionId, `warning_${warning.toLowerCase()}`);
@@ -868,6 +886,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       if (fullUrlForDetection.includes('/foryou') || fullUrlForDetection.includes('/home') ||
           (fullUrlForDetection.includes('tiktok.com') && !fullUrlForDetection.includes('/login') && !fullUrlForDetection.includes('/qrcode'))) {
         console.log(`✅ Auth ${authSessionId.substring(0, 8)} login detected via URL: ${fullUrlForDetection.substring(0, 60)}`);
+        log.ok('AUTH', 'login_detected', { session: authSessionId.substring(0, 8), duration: `${Math.round((Date.now() - startTime) / 1000)}s`, cookie_count: arrivedCookies.size });
 
         // Extract session data
         const sessionData = await extractAuthData(page);
@@ -889,6 +908,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 
         try {
           await destroyAuthContainer(authSessionId);
+          log.ok('AUTH', 'auth_cleanup', { session: authSessionId.substring(0, 8), outcome: 'success' });
         } catch (recycleError) {
           console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
         }
@@ -899,6 +919,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       // 6b. SECONDARY: Cookie-based detection (sessionid sufficient, like Nov 13 version)
       if (arrivedCookies.has('sessionid')) {
         console.log(`✅ Auth ${authSessionId.substring(0, 8)} login successful (sessionid cookie detected)`);
+        log.ok('AUTH', 'login_detected', { session: authSessionId.substring(0, 8), duration: `${Math.round((Date.now() - startTime) / 1000)}s`, cookie_count: arrivedCookies.size });
 
         // Extract session data (cookies in plaintext - INSIDE TEE)
         const sessionData = await extractAuthData(page);
@@ -922,6 +943,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         // v19: Recycle auth container (cleared and returned to pool for next user)
         try {
           await destroyAuthContainer(authSessionId);
+          log.ok('AUTH', 'auth_cleanup', { session: authSessionId.substring(0, 8), outcome: 'success' });
         } catch (recycleError) {
           console.error(`⚠️ Failed to recycle auth container for ${authSessionId}`);
         }
@@ -967,6 +989,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
   // v19: Recycle timed-out auth container
   try {
     await destroyAuthContainer(authSessionId);
+    log.ok('AUTH', 'auth_cleanup', { session: authSessionId.substring(0, 8), outcome: 'timeout' });
   } catch (recycleError) {
     console.error(`⚠️ Failed to recycle timed-out auth container for ${authSessionId}`);
   }
@@ -1158,7 +1181,10 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    const requestId = req.headers['x-queue-request-id'] as string || '';
+    log.ok('AUTH', 'sample_started', { session: sessionId.substring(0, 8), request_id: requestId, type: 'foryoupage' });
     console.log(`🎯 Starting For You page sampling for session ${sessionId.substring(0, 8)}... (count: ${count})`);
+    const sampleStart = Date.now();
 
     const { browser: browserInstance, cdpUrl } = await requestBrowserInstance(sessionId);
 
@@ -1174,7 +1200,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
         sampled_at: new Date().toISOString()
       };
 
-      console.log(`✅ Sampling completed: ${result.videos?.length || 0} videos`);
+      log.ok('AUTH', 'sample_complete', { session: sessionId.substring(0, 8), request_id: requestId, type: 'foryoupage', count: result.videos?.length || 0, duration: `${Date.now() - sampleStart}ms` });
       res.json(result);
 
     } finally {
@@ -1183,6 +1209,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
 
   } catch (error: any) {
     console.error(`❌ Sampling error for ${req.params.sessionId}:`, error.message);
+    log.fail('AUTH', 'sample_failed', { session: req.params.sessionId.substring(0, 8), request_id: req.headers['x-queue-request-id'] as string || '', type: 'foryoupage', error: error.message, duration: '0ms' });
     res.status(500).json({ error: error.message });
   }
 });
@@ -2386,10 +2413,28 @@ async function startServer(): Promise<void> {
     await authSessionManager?.cleanupExpired();
   }, 60000); // Every minute
 
+  // T1: Heartbeat every 5 minutes
+  setInterval(() => {
+    const uptimeSec = Math.round((Date.now() - startTime) / 1000);
+    const hours = Math.floor(uptimeSec / 3600);
+    const mins = Math.floor((uptimeSec % 3600) / 60);
+    const uptimeStr = `${hours}h${mins}m`;
+    const bmStats = fetch(`${BROWSER_MANAGER_URL}/stats`).then(r => r.json()).catch(() => ({ total: 0, poolSize: 0, assigned: 0 }));
+    bmStats.then((stats: any) => {
+      log.ok('HEALTH', 'heartbeat', {
+        uptime: uptimeStr,
+        pool_total: stats.poolSize || stats.total || 0,
+        pool_idle: (stats.poolSize || stats.total || 0) - (stats.assigned || 0),
+        auth_active: sessionManager?.getSessionCount() || 0
+      });
+    }).catch(() => {});
+  }, 5 * 60 * 1000);
+
   app.listen(PORT, () => {
     console.log(`🚀 Multi-User TCB Server running on port ${PORT}`);
     console.log(`📊 Session timeout: ${Math.round(3600000 / 60000)} minutes`);
     console.log(`🔐 Auth session timeout: ${Math.round(120000 / 1000)} seconds`);
+    log.ok('HEALTH', 'startup_ok', { port: PORT, version: 'v1.1.3NX' });
   });
 }
 
