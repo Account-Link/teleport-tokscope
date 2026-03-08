@@ -61,6 +61,104 @@ function logAuthTrace(authSessionId: string, event: string, fields: Record<strin
   console.log(`AUTH_TRACE ${payload}`);
 }
 
+async function fetchContainerResourceSnapshot(containerId: string): Promise<StageResourceSample | null> {
+  try {
+    const response = await axios.get(`${BROWSER_MANAGER_URL}/resource/container/${encodeURIComponent(containerId)}`, {
+      timeout: 3000,
+    });
+    const container = response.data?.container;
+    if (!container) {
+      return null;
+    }
+    return {
+      cpuPercent: Number(container.cpuPercent || 0),
+      memPercent: Number(container.memPercent || 0),
+      usedMemoryMb: Number(container.usedMemoryMb || 0),
+      memoryLimitMb: Number(container.memoryLimitMb || 0),
+      timestampMs: Number(response.data?.timestamp_ms || Date.now()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function summarizeStageSamples(samples: StageResourceSample[]): Record<string, number> {
+  if (!samples.length) {
+    return {
+      sample_count: 0,
+      browser_cpu_avg: 0,
+      browser_cpu_peak: 0,
+      browser_mem_avg: 0,
+      browser_mem_peak: 0,
+      browser_used_mem_peak_mb: 0,
+    };
+  }
+  const cpuVals = samples.map(sample => sample.cpuPercent);
+  const memVals = samples.map(sample => sample.memPercent);
+  const usedVals = samples.map(sample => sample.usedMemoryMb);
+  return {
+    sample_count: samples.length,
+    browser_cpu_avg: cpuVals.reduce((sum, value) => sum + value, 0) / cpuVals.length,
+    browser_cpu_peak: Math.max(...cpuVals),
+    browser_mem_avg: memVals.reduce((sum, value) => sum + value, 0) / memVals.length,
+    browser_mem_peak: Math.max(...memVals),
+    browser_used_mem_peak_mb: Math.max(...usedVals),
+  };
+}
+
+async function runStageWithResourceSampling<T>(
+  authSessionId: string,
+  stageName: string,
+  containerId: string | null,
+  fn: () => Promise<T>
+): Promise<T> {
+  const finishSampler = await startStageResourceSampler(authSessionId, stageName, containerId);
+  try {
+    return await fn();
+  } finally {
+    await finishSampler();
+  }
+}
+
+async function startStageResourceSampler(
+  authSessionId: string,
+  stageName: string,
+  containerId: string | null,
+): Promise<() => Promise<void>> {
+  if (!containerId) {
+    return async () => {};
+  }
+
+  const samples: StageResourceSample[] = [];
+  let stopped = false;
+  const startedAt = Date.now();
+
+  const sampler = (async () => {
+    while (!stopped) {
+      const snapshot = await fetchContainerResourceSnapshot(containerId);
+      if (snapshot) {
+        samples.push(snapshot);
+      }
+      if (stopped) {
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  })();
+
+  return async () => {
+    stopped = true;
+    await sampler.catch(() => {});
+    const summary = summarizeStageSamples(samples);
+    logAuthTrace(authSessionId, 'stage_resource_summary', {
+      stage_name: stageName,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+      container_id: containerId,
+      ...summary,
+    });
+  };
+}
+
 interface SessionData {
   user?: {
     sec_user_id?: string;
@@ -106,6 +204,14 @@ interface AuthSession {
   loginDetectedAt: number | null;
   storeUserStartAt: number | null;
   storeUserDoneAt: number | null;
+}
+
+interface StageResourceSample {
+  cpuPercent: number;
+  memPercent: number;
+  usedMemoryMb: number;
+  memoryLimitMb: number;
+  timestampMs: number;
 }
 
 
@@ -691,9 +797,11 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         logAuthTrace(authSessionId, 'qr_navigation_started', {
           url: 'https://www.tiktok.com/login/qrcode',
         });
-        await authPage.goto('https://www.tiktok.com/login/qrcode', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
+        await runStageWithResourceSampling(authSessionId, 'qr_navigation', browserInstance.containerId, async () => {
+          await authPage.goto('https://www.tiktok.com/login/qrcode', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
         });
         logAuthTrace(authSessionId, 'qr_navigation_done', {
           qr_navigation_ms: Math.max(0, Date.now() - qrNavigationStartedAt),
@@ -703,9 +811,11 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // Wait for QR code with diagnostics on failure
         try {
           logAuthTrace(authSessionId, 'qr_wait_visible_started');
-          await authPage.waitForSelector('img[alt="qrcode"]', {
-            timeout: 15000,  // z-5a: increased from 10s to 15s
-            state: 'visible'
+          await runStageWithResourceSampling(authSessionId, 'qr_wait_visible', browserInstance.containerId, async () => {
+            await authPage.waitForSelector('img[alt="qrcode"]', {
+              timeout: 15000,  // z-5a: increased from 10s to 15s
+              state: 'visible'
+            });
           });
           const now = Date.now();
           const session = authSessionManager.getAuthSession(authSessionId);
@@ -774,7 +884,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         // Extract and decode QR code
         const qrExtractStartedAt = Date.now();
         logAuthTrace(authSessionId, 'qr_extract_started');
-        const qrData = await QRExtractor.extractQRCodeFromPage(authPage, authSessionId);
+        const qrData = await runStageWithResourceSampling(authSessionId, 'qr_extract', browserInstance.containerId, async () =>
+          QRExtractor.extractQRCodeFromPage(authPage, authSessionId)
+        );
         const qrExtractedAt = Date.now();
         authSessionManager.updateAuthSession(authSessionId, {
           qrCodeData: qrData.image,
@@ -798,7 +910,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
 
         // Start polling for login completion
-        await waitForLoginCompletion(authSessionId, authPage, preAuthToken);
+        await waitForLoginCompletion(authSessionId, authPage, browserInstance.containerId, preAuthToken);
 
       } catch (error: any) {
         console.error(`❌ Auth flow error for ${authSessionId}:`, error.message);
@@ -832,9 +944,18 @@ app.post('/auth/start/:sessionId', async (req, res) => {
   }
 });
 
-async function waitForLoginCompletion(authSessionId: string, page: Page, preAuthToken?: string): Promise<void> {
+async function waitForLoginCompletion(authSessionId: string, page: Page, containerId: string | null, preAuthToken?: string): Promise<void> {
   const timeout = 120000; // 2 minutes
   const startTime = Date.now();
+  const finishLoginWaitSampling = await startStageResourceSampler(authSessionId, 'login_wait', containerId);
+  let loginWaitSamplingClosed = false;
+  const closeLoginWaitSampling = async () => {
+    if (loginWaitSamplingClosed) {
+      return;
+    }
+    loginWaitSamplingClosed = true;
+    await finishLoginWaitSampling();
+  };
   logAuthTrace(authSessionId, 'login_wait_started', {
     login_wait_timeout_ms: timeout,
   });
@@ -922,13 +1043,14 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
       // 2. Early CAPTCHA detection - fail fast, don't wait 2 minutes
       if (baseUrl.includes('google.com') || baseUrl.includes('captcha') || baseUrl.includes('recaptcha')) {
         console.error(`🚫 Auth ${authSessionId.substring(0, 8)} CAPTCHA detected - aborting`);
-        logAuthTrace(authSessionId, 'login_wait_aborted', {
-          reason: 'captcha_redirect',
-          current_url: baseUrl,
-        });
-        authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
-        await destroyAuthContainer(authSessionId);
-        return;
+          logAuthTrace(authSessionId, 'login_wait_aborted', {
+            reason: 'captcha_redirect',
+            current_url: baseUrl,
+          });
+          await closeLoginWaitSampling();
+          authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
+          await destroyAuthContainer(authSessionId);
+          return;
       }
 
       // 3. Get ALL cookies - requiredCookies check handles filtering (v3-t)
@@ -1021,8 +1143,9 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 
 
         // TEE Integration: Encrypt and store via Xordi
+        await closeLoginWaitSampling();
         if (preAuthToken && sessionData) {
-          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId, containerId);
         } else {
           if (sessionManager && sessionData) {
             const newSessionId = sessionManager.storeSession(sessionData);
@@ -1065,8 +1188,9 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
         });
 
         // TEE Integration: Encrypt and store via Xordi
+        await closeLoginWaitSampling();
         if (preAuthToken && sessionData) {
-          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId, containerId);
         } else {
           // Legacy flow: Store session locally (fallback)
           if (sessionManager && sessionData) {
@@ -1122,6 +1246,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
     arrived_cookie_count: arrivedCookies.size,
     final_url: page.url().split('?')[0],
   });
+  await closeLoginWaitSampling();
 
   // v3-s: Capture screenshot at timeout to see final page state
   await captureDebugScreenshot(page, authSessionId, 'timeout_no_cookies');
@@ -1139,9 +1264,10 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
 /**
  * Store user with TEE-encrypted cookies (Phase 2 + 3 of pre-auth flow)
  */
-async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken: string, authSessionId: string): Promise<void> {
+async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken: string, authSessionId: string, containerId: string | null): Promise<void> {
   const storeStart = Date.now();
   logAuthTrace(authSessionId, 'store_user_started');
+  const finishStoreUserSampling = await startStageResourceSampler(authSessionId, 'store_user', containerId);
   try {
     if (authSessionManager) {
       authSessionManager.updateAuthSession(authSessionId, {
@@ -1261,6 +1387,8 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
       error_code: toTraceCode(error?.message || error),
     });
     throw error;
+  } finally {
+    await finishStoreUserSampling();
   }
 }
 

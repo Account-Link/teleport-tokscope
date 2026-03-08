@@ -62,6 +62,14 @@ interface ContainerInfo {
   sessionId: string | null;
 }
 
+interface ContainerResourceSnapshot {
+  name: string;
+  cpuPercent: number;
+  memPercent: number;
+  usedMemoryMb: number;
+  memoryLimitMb: number;
+}
+
 class BrowserManager {
   private config: Config = {
     tcb: {
@@ -73,6 +81,49 @@ class BrowserManager {
   private containerPool: string[] = [];
   private isInitialized = false;
   private isMaintenanceRunning = false; // NEW: Lock flag for pool maintenance
+
+  private parseSizeToMb(rawValue: string): number {
+    const text = String(rawValue || '').trim().toLowerCase();
+    const match = text.match(/^([0-9]*\.?[0-9]+)\s*([kmgt]?i?b)?/);
+    if (!match) return 0;
+    const value = parseFloat(match[1]);
+    const unit = match[2] || 'b';
+    const factors: Record<string, number> = {
+      b: 1 / (1024 * 1024),
+      kib: 1 / 1024,
+      kb: 1 / 1024,
+      mib: 1,
+      mb: 1,
+      gib: 1024,
+      gb: 1024,
+      tib: 1024 * 1024,
+      tb: 1024 * 1024,
+    };
+    return value * (factors[unit] || 0);
+  }
+
+  async getContainerResourceSnapshot(containerId: string): Promise<ContainerResourceSnapshot | null> {
+    try {
+      const { stdout } = await execAsync(`docker stats --no-stream --format "{{json .}}" ${containerId}`);
+      const raw = stdout.trim().split('\n').find(line => line.trim());
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw);
+      const memUsage = String(parsed.MemUsage || '');
+      const [usedRaw, limitRaw] = memUsage.split('/').map(part => (part || '').trim());
+      return {
+        name: String(parsed.Name || containerId),
+        cpuPercent: parseFloat(String(parsed.CPUPerc || '0').replace('%', '')) || 0,
+        memPercent: parseFloat(String(parsed.MemPerc || '0').replace('%', '')) || 0,
+        usedMemoryMb: this.parseSizeToMb(usedRaw),
+        memoryLimitMb: this.parseSizeToMb(limitRaw),
+      };
+    } catch (error: any) {
+      console.error(`Failed to get container stats for ${containerId}:`, error.message);
+      return null;
+    }
+  }
 
   initialize(): void {
     this.isInitialized = true;
@@ -775,6 +826,24 @@ async function main() {
   app.get('/stats', (req, res) => {
     const stats = browserManager.getStats();
     res.json(stats);
+  });
+
+  app.get('/resource/container/:containerId', async (req, res) => {
+    try {
+      const { containerId } = req.params;
+      const snapshot = await browserManager.getContainerResourceSnapshot(containerId);
+      if (!snapshot) {
+        return res.status(404).json({ error: 'Container stats not available' });
+      }
+      res.json({
+        timestamp_ms: Date.now(),
+        container: snapshot,
+        poolSize: browserManager.getPoolSize(),
+      });
+    } catch (error) {
+      console.error('Container resource endpoint error:', error);
+      res.status(500).json({ error: (error as Error).message });
+    }
   });
 
   // Health check
