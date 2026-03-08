@@ -68,7 +68,14 @@ interface AuthSession {
   qrDecodedUrl?: string | null;  // Magic link URL
   sessionData: SessionData | null;
   startedAt: number;
+  qrRequestedAt: number;
+  qrVisibleAt: number | null;
+  qrExtractedAt: number | null;
+  loginDetectedAt: number | null;
+  storeUserStartAt: number | null;
+  storeUserDoneAt: number | null;
 }
+
 
 // v3-s: Debug screenshot storage (in-memory with TTL)
 interface DebugScreenshot {
@@ -154,6 +161,7 @@ class AuthSessionManager {
 
   createAuthSession(sessionId: string): string {
     const authSessionId = this.generateAuthSessionId();
+    const now = Date.now();
     this.authSessions.set(authSessionId, {
       authSessionId,
       sessionId,
@@ -162,11 +170,19 @@ class AuthSessionManager {
       containerId: null,
       status: 'awaiting_scan',
       qrCodeData: null,
+      qrDecodedUrl: null,
       sessionData: null,
-      startedAt: Date.now()
+      startedAt: now,
+      qrRequestedAt: now,
+      qrVisibleAt: null,
+      qrExtractedAt: null,
+      loginDetectedAt: null,
+      storeUserStartAt: null,
+      storeUserDoneAt: null,
     });
     return authSessionId;
   }
+
 
   getAuthSession(authSessionId: string): AuthSession | null {
     return this.authSessions.get(authSessionId) || null;
@@ -574,6 +590,10 @@ app.post('/auth/start/:sessionId', async (req, res) => {
 
     // Create auth session
     const authSessionId = authSessionManager.createAuthSession(sessionId);
+    const startSession = authSessionManager.getAuthSession(authSessionId);
+    const qrRequestedAt = startSession?.qrRequestedAt || startSession?.startedAt || Date.now();
+    console.log(`AUTH_TRACE authSessionId=${authSessionId} event=qr_requested qr_requested_at_ms=${qrRequestedAt}`);
+
 
     // Start authentication flow asynchronously
     (async () => {
@@ -606,10 +626,19 @@ app.post('/auth/start/:sessionId', async (req, res) => {
             timeout: 15000,  // z-5a: increased from 10s to 15s
             state: 'visible'
           });
+          const now = Date.now();
+          const session = authSessionManager.getAuthSession(authSessionId);
+          const qrRequestedAt = session?.qrRequestedAt || session?.startedAt || now;
+          const tee_qr_page_open_ms = Math.max(0, now - qrRequestedAt);
+          authSessionManager.updateAuthSession(authSessionId, {
+            qrVisibleAt: now
+          });
           console.log(`✅ QR code visible for auth ${authSessionId.substring(0, 8)}...`);
+          console.log(`AUTH_TRACE authSessionId=${authSessionId} event=qr_visible tee_qr_page_open_ms=${tee_qr_page_open_ms}`);
           // Capture screenshot when QR is visible (for debugging)
           await captureDebugScreenshot(authPage, authSessionId, 'qr_visible');
         } catch (qrWaitError) {
+
           // QR didn't appear - diagnose what's blocking
           const currentUrl = authPage.url();
           const pageState = await authPage.evaluate(() => {
@@ -848,6 +877,15 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           (fullUrlForDetection.includes('tiktok.com') && !fullUrlForDetection.includes('/login') && !fullUrlForDetection.includes('/qrcode'))) {
         console.log(`✅ Auth ${authSessionId.substring(0, 8)} login detected via URL: ${fullUrlForDetection.substring(0, 60)}`);
 
+        const loginDetectedAt = Date.now();
+        const session = authSessionManager!.getAuthSession(authSessionId);
+        const qrExtractedAt = session?.qrExtractedAt || session?.qrVisibleAt || session?.qrRequestedAt || startTime;
+        const tee_wait_for_scan_ms = Math.max(0, loginDetectedAt - qrExtractedAt);
+        authSessionManager!.updateAuthSession(authSessionId, {
+          loginDetectedAt
+        });
+        console.log(`AUTH_TRACE authSessionId=${authSessionId} event=login_detected tee_wait_for_scan_ms=${tee_wait_for_scan_ms}`);
+
         // Extract session data
         const sessionData = await extractAuthData(page);
 
@@ -855,6 +893,7 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
           status: 'complete',
           sessionData
         });
+
 
         // TEE Integration: Encrypt and store via Xordi
         if (preAuthToken && sessionData) {
@@ -955,7 +994,14 @@ async function waitForLoginCompletion(authSessionId: string, page: Page, preAuth
  * Store user with TEE-encrypted cookies (Phase 2 + 3 of pre-auth flow)
  */
 async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken: string, authSessionId: string): Promise<void> {
+  const storeStart = Date.now();
   try {
+    if (authSessionManager) {
+      authSessionManager.updateAuthSession(authSessionId, {
+        storeUserStartAt: storeStart
+      });
+    }
+
     const xordiApiUrl = process.env.XORDI_API_URL || 'http://xordi-private-api:3001';
     const xordiApiKey = process.env.XORDI_API_KEY;
 
@@ -1034,7 +1080,24 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
       console.log(`💾 Session also stored locally for immediate use`);
     }
 
+    // Record timing for store_user and total auth flow
+    if (authSessionManager) {
+      const storeDone = Date.now();
+      const session = authSessionManager.getAuthSession(authSessionId);
+      const startAt = session?.storeUserStartAt || storeStart;
+      const qrRequestedAt = session?.qrRequestedAt || session?.startedAt || storeStart;
+      const tee_store_user_ms = Math.max(0, storeDone - startAt);
+      const tee_total_auth_ms = Math.max(0, storeDone - qrRequestedAt);
+      authSessionManager.updateAuthSession(authSessionId, {
+        storeUserDoneAt: storeDone,
+      });
+      console.log(
+        `AUTH_TRACE authSessionId=${authSessionId} event=store_user_done tee_store_user_ms=${tee_store_user_ms} tee_total_auth_ms=${tee_total_auth_ms}`
+      );
+    }
+
   } catch (error: any) {
+
     console.error('❌ TEE encryption/storage failed:', error.message);
     throw error;
   }
@@ -1059,17 +1122,38 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
       return res.status(404).json({ error: 'Auth session not found' });
     }
 
+    const timing: any = {};
+    const s = authSession as any;
+    if (typeof s.qrRequestedAt === 'number' && typeof s.qrVisibleAt === 'number') {
+      timing.tee_qr_page_open_ms = Math.max(0, s.qrVisibleAt - s.qrRequestedAt);
+    }
+    if (typeof s.qrVisibleAt === 'number' && typeof s.qrExtractedAt === 'number') {
+      timing.tee_qr_extract_ms = Math.max(0, s.qrExtractedAt - s.qrVisibleAt);
+    }
+    if (typeof s.qrExtractedAt === 'number' && typeof s.loginDetectedAt === 'number') {
+      timing.tee_wait_for_scan_ms = Math.max(0, s.loginDetectedAt - s.qrExtractedAt);
+    }
+    if (typeof s.storeUserStartAt === 'number' && typeof s.storeUserDoneAt === 'number') {
+      timing.tee_store_user_ms = Math.max(0, s.storeUserDoneAt - s.storeUserStartAt);
+    }
+    if (typeof s.qrRequestedAt === 'number' && typeof s.storeUserDoneAt === 'number') {
+      timing.tee_total_auth_ms = Math.max(0, s.storeUserDoneAt - s.qrRequestedAt);
+    }
+
     if (authSession.status === 'awaiting_scan') {
       res.json({
         status: 'awaiting_scan',
         qrCodeData: authSession.qrCodeData,
-        qrDecodedUrl: authSession.qrDecodedUrl  // Include magic link
+        qrDecodedUrl: authSession.qrDecodedUrl,  // Include magic link
+        timing
       });
     } else if (authSession.status === 'complete') {
       res.json({
         status: 'complete',
-        sessionData: authSession.sessionData
+        sessionData: authSession.sessionData,
+        timing
       });
+
 
       // Clean up auth session after successful poll
       authSessionManager.removeAuthSession(authSessionId);
