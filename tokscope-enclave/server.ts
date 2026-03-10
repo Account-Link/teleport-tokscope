@@ -449,6 +449,7 @@ let browser: Browser | null = null;
 let page: Page | null = null;
 let dstackSDK: any = null;
 let encryptionKey: Buffer | null = null;
+let lastKnownGatewayUrl: string = ''; // Set from borgcube's gatewayUrl in portal requests
 let sessionManager: SessionManager | null = null;
 let authSessionManager: AuthSessionManager | null = null;
 let moduleLoader: any = null;
@@ -638,7 +639,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
       preAuthToken,
       portalMode,
       portalTimeoutMs: rawPortalTimeoutMs,
-      portalLoginUrl
+      portalLoginUrl,
+      gatewayUrl
     } = req.body;
 
     if (!authSessionManager) {
@@ -701,11 +703,12 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           // Generate one-time session token (256-bit random, maps to container Neko credentials)
           const sessionToken = crypto.randomBytes(32).toString('hex');
 
-          // Build portal URL: auth proxy on tokscope API port 3000
-          // Format: https://{app-id}-3000.{dstack-gateway}/auth/portal/{SESSION_TOKEN}
-          const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+          // Build portal URL using gatewayUrl from borgcube (knows the CVM's public URL)
+          const dstackGateway = gatewayUrl || process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
           let portalSessionUrl: string;
           if (dstackGateway) {
+            // Cache for use in /auth/portal redirect (Neko URL construction)
+            lastKnownGatewayUrl = dstackGateway;
             portalSessionUrl = `${dstackGateway}/auth/portal/${sessionToken}`;
           } else {
             // Fallback for non-Dstack environments: use local URL
@@ -1405,7 +1408,7 @@ app.get('/auth/portal/:sessionToken', async (req, res) => {
     if (!nekoCreds) {
       console.warn(`⚠️ No Neko credentials found for container ${authSession.containerId.substring(0, 16)}, falling back to URL params`);
       // Fallback: redirect with credentials in URL params (less secure but functional)
-      const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+      const dstackGateway = process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
       const nekoPublicUrl = dstackGateway
         ? `${dstackGateway.replace('-3000.', '-8080.')}`
         : `http://${containerIp}:8080`;
@@ -1440,7 +1443,7 @@ app.get('/auth/portal/:sessionToken', async (req, res) => {
     }
 
     // Build redirect URL to Neko with embed=1 (no credentials)
-    const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+    const dstackGateway = process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
     let nekoPublicUrl: string;
     if (dstackGateway) {
       // Replace port 3000 with 8080 in Dstack gateway URL
