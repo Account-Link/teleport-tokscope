@@ -230,9 +230,11 @@ class AuthSessionManager {
  * This is the fix for the dual CDP connection bug (Solution F)
  * browser-manager only manages Docker lifecycle, we own CDP/context/page
  */
-async function requestBrowserInstance(sessionId: string): Promise<BrowserInstance> {
-  console.log(`🔄 Requesting browser instance from ${BROWSER_MANAGER_URL}/assign/${sessionId}`);
-  const response = await fetch(`${BROWSER_MANAGER_URL}/assign/${sessionId}`, {
+async function requestBrowserInstance(sessionId: string, portalMode: boolean = false): Promise<BrowserInstance> {
+  // v1.1.3combo2: portal mode uses on-demand container with host port publishing (/assign-portal)
+  const assignPath = portalMode ? `assign-portal/${sessionId}` : `assign/${sessionId}`;
+  console.log(`🔄 Requesting browser instance from ${BROWSER_MANAGER_URL}/${assignPath}`);
+  const response = await fetch(`${BROWSER_MANAGER_URL}/${assignPath}`, {
     method: 'POST'
   });
   console.log(`🔄 Browser manager response status: ${response.status}`);
@@ -677,7 +679,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
       try {
         // v3-v: Request browser container - NOW INCLUDES context/page creation
         // This is the Solution F fix: single CDP connection owns everything
-        browserInstance = await requestBrowserInstance(authSessionId);
+        // v1.1.3combo2: portal mode uses /assign-portal (on-demand, with port publishing)
+        browserInstance = await requestBrowserInstance(authSessionId, isPortalMode);
 
         authSessionManager.updateAuthSession(authSessionId, {
           containerId: browserInstance.containerId,

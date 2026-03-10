@@ -267,6 +267,196 @@ class BrowserManager {
     }
   }
 
+  /**
+   * v1.1.3combo2: Create a portal-specific container with host port publishing.
+   * NOT pooled — created on-demand when a portal session starts.
+   * Publishes ports 8080 (Neko signaling) and 3478 (coturn TURN-over-TLS)
+   * so Dstack gateway can route to them.
+   */
+  async createPortalContainer(sessionId: string): Promise<ContainerInfo> {
+    if (!this.isInitialized) {
+      throw new Error('Browser Manager not initialized');
+    }
+
+    // Check if portal ports are already bound (single-portal enforcement)
+    try {
+      const { stdout } = await execAsync('docker ps --filter "publish=8080" --format "{{.Names}}"');
+      if (stdout.trim()) {
+        throw new Error(`Portal ports already in use by container: ${stdout.trim()}`);
+      }
+    } catch (error: any) {
+      if (error.message.includes('Portal ports already in use')) throw error;
+      // docker ps failed — proceed and let --publish fail naturally if conflict exists
+    }
+
+    const containerId = this.generateContainerId();
+    const network = process.env.DOCKER_NETWORK || 'xordi-proprietary-modules_enclave-api-network';
+    const subnet = process.env.DOCKER_SUBNET || '172.19.0.0/16';
+
+    try {
+      console.log(`🌐 Creating PORTAL container: ${containerId} (with --publish 8080, 3478)`);
+
+      try {
+        await execAsync(`docker network inspect ${network}`);
+      } catch {
+        try {
+          await execAsync(`docker network create --driver bridge --subnet ${subnet} ${network}`);
+        } catch (error) {
+          log.warn('BROWSER', 'network_create_failed', { network, error: (error as any).message });
+        }
+      }
+
+      // Per-container credentials (same pattern as createContainer, line 117-119)
+      const nekoUserPassword = cryptoModule.randomBytes(16).toString('hex');
+      const nekoAdminPassword = cryptoModule.randomBytes(16).toString('hex');
+      const nekoApiToken = cryptoModule.randomBytes(24).toString('hex');
+      const turnPassword = cryptoModule.randomBytes(16).toString('hex');
+
+      // Derive TURN domain from DSTACK_GATEWAY_URL (already in .env.example line 69)
+      // Example: DSTACK_GATEWAY_URL=https://abc123-3000.dstack-base-prod5.phala.network
+      //   → turnDomain = abc123-3478s.dstack-base-prod5.phala.network
+      const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+      let turnIceServersJson = '';
+      if (dstackGateway) {
+        const gatewayUrl = new URL(dstackGateway);
+        const turnDomain = gatewayUrl.hostname.replace(/-3000\./, '-3478s.');
+        turnIceServersJson = JSON.stringify([{
+          urls: [`turns:${turnDomain}:443?transport=tcp`],
+          username: 'portal',
+          credential: turnPassword
+        }]);
+      }
+
+      const dockerCmd = [
+        'docker', 'run', '-d',
+        '--name', containerId,
+        '--hostname', containerId,
+        '--network', network,
+        '--env', `CONTAINER_NAME=${containerId}`,
+        '--env', `NEKO_DESKTOP_SCREEN=${process.env.NEKO_DESKTOP_SCREEN || '1920x1080@30'}`,
+        '--env', `NEKO_DESKTOP_SCALING=${process.env.NEKO_DESKTOP_SCALING || '1.0'}`,
+        // Neko credentials
+        '--env', `NEKO_MEMBER_MULTIUSER_USER_PASSWORD=${nekoUserPassword}`,
+        '--env', `NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=${nekoAdminPassword}`,
+        '--env', `NEKO_SESSION_API_TOKEN=${nekoApiToken}`,
+        // WebRTC configuration (portal-only)
+        '--env', 'NEKO_WEBRTC_TCPMUX=56000',
+        '--env', 'NEKO_WEBRTC_ICELITE=true',
+        '--env', 'NEKO_WEBRTC_NAT1TO1=127.0.0.1',
+        '--env', `NEKO_WEBRTC_ICESERVERS_FRONTEND=${turnIceServersJson}`,
+        '--env', 'NEKO_WEBRTC_ICESERVERS_BACKEND=',
+        // coturn credentials (triggers start-coturn.sh to actually start coturn)
+        '--env', `TURN_PASSWORD=${turnPassword}`,
+        // Portal ports — published to CVM host for Dstack gateway routing
+        '--publish', '8080:8080',
+        '--publish', '3478:3478',
+        '--restart', 'no'
+      ];
+
+      // Resource limits (same logic as createContainer, lines 142-161)
+      const isPhala = !!process.env.PHALA_ENV;
+      const cpuLimitStr = !isPhala ? process.env.BROWSER_CPU_LIMIT : undefined;
+      if (!isPhala && cpuLimitStr) {
+        const limit = parseFloat(cpuLimitStr);
+        if (Number.isFinite(limit) && limit > 0) {
+          dockerCmd.push('--cpus', limit.toString());
+        }
+      }
+      if (process.env.BROWSER_MEMORY_LIMIT) {
+        dockerCmd.push('--memory', process.env.BROWSER_MEMORY_LIMIT);
+      }
+      if (process.env.BROWSER_MEMORY_RESERVATION) {
+        dockerCmd.push('--memory-reservation', process.env.BROWSER_MEMORY_RESERVATION);
+      }
+
+      dockerCmd.push(process.env.TCB_BROWSER_IMAGE || 'xordi-proprietary-modules-tcb-browser:latest');
+
+      const { stdout: runResult } = await execAsync(dockerCmd.join(' '));
+      const result = runResult.trim();
+      const shortContainerId = result.substring(0, 12);
+
+      // Wait for container ready (same pattern as createContainer, lines 177-199)
+      let retries = 0;
+      while (retries < 60) {
+        try {
+          const { stdout: statusOut } = await execAsync(`docker inspect --format='{{.State.Status}}' ${containerId}`);
+          if (statusOut.trim() !== 'running') {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            retries += 2;
+            continue;
+          }
+          await execAsync(`docker exec ${containerId} supervisorctl status neko`);
+          break;
+        } catch {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          retries += 2;
+        }
+      }
+      if (retries >= 60) {
+        throw new Error(`Portal container ${containerId} failed to start within 60 seconds`);
+      }
+
+      const { stdout: ipOut } = await execAsync(
+        `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`
+      );
+      const containerIP = ipOut.trim();
+
+      await this.waitForBrowserReady(containerIP);
+
+      const containerInfo: ContainerInfo = {
+        containerId,
+        shortId: shortContainerId,
+        ip: containerIP,
+        cdpUrl: `http://${containerIP}:9223`,
+        createdAt: Date.now(),
+        lastUsed: Date.now(),
+        status: 'assigned',  // Immediately assigned, never pooled
+        sessionId,
+        nekoUserPassword,
+        nekoAdminPassword,
+        nekoApiToken
+      };
+
+      // Configure proxy (same as pool containers)
+      await this.configureContainerProxy(containerInfo);
+
+      // Pre-navigate to TikTok (same as pool containers)
+      await this.preNavigateToTikTok(containerInfo);
+
+      // Track in containers map (NOT in pool)
+      this.containers.set(containerId, containerInfo);
+      this.sessionToContainer.set(sessionId, containerId);
+
+      // Register Neko creds with server.ts
+      const enclaveApiUrl = `http://localhost:${process.env.PORT || '3000'}`;
+      fetch(`${enclaveApiUrl}/internal/container-neko-creds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          containerId,
+          userPassword: nekoUserPassword,
+          adminPassword: nekoAdminPassword,
+          apiToken: nekoApiToken
+        })
+      }).catch((err: any) => {
+        console.warn(`⚠️ Failed to register Neko creds for portal ${containerId.substring(0, 16)}: ${err.message}`);
+      });
+
+      log.ok('BROWSER', 'portal_container_created', {
+        id: shortContainerId,
+        session: sessionId.substring(0, 8),
+        duration: `${Date.now() - containerInfo.createdAt}ms`
+      });
+
+      return containerInfo;
+
+    } catch (error: any) {
+      log.fail('BROWSER', 'portal_container_failed', { error: error.message });
+      await execAsync(`docker rm -f ${containerId}`).catch(() => {});
+      throw error;
+    }
+  }
+
   async assignContainer(sessionId: string): Promise<ContainerInfo> {
     if (!this.isInitialized) {
       throw new Error('Browser Manager not initialized');
@@ -665,6 +855,20 @@ async function main() {
       res.json({ container });
     } catch (error) {
       console.error('Failed to assign container:', error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+
+  // v1.1.3combo2: Assign a portal-specific container (on-demand, with port publishing)
+  app.post('/assign-portal/:sessionId', async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      console.log(`🌐 Portal assign request for session: ${sessionId.substring(0, 8)}...`);
+      const container = await browserManager.createPortalContainer(sessionId);
+      console.log(`🌐 Portal container created: ${container.containerId.substring(0, 20)}... (IP: ${container.ip})`);
+      res.json({ container });
+    } catch (error) {
+      console.error('Failed to create portal container:', error);
       res.status(500).json({ error: (error as Error).message });
     }
   });
