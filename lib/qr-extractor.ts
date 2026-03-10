@@ -136,9 +136,6 @@ class QRExtractor {
         // IMG is usually promotional QR (slow CORS load, 57+ seconds)
         // Strategy: Wait for Canvas to render instead of processing IMG
         if (images.length > 0 && canvases.length === 0) {
-          // Commented out - too spammy on retries
-          // console.log('⏭️  Skipping IMG elements - waiting for Canvas to render (optimization)');
-          // console.log(`   Found ${images.length} IMG but 0 Canvas - will retry`);
           return null; // Trigger retry loop to wait for Canvas
         }
 
