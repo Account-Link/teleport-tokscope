@@ -69,6 +69,8 @@ interface AuthSession {
   qrDecodedUrl?: string | null;  // Magic link URL
   sessionData: SessionData | null;
   startedAt: number;
+  timeoutMs: number;  // v1.1.3login: per-session timeout (QR=AUTH_TIMEOUT_MS, portal=portalTimeoutMs)
+  portalSessionUrl?: string | null;  // v1.1.3login: session-token portal URL for WebRTC access
 }
 
 // v3-s: Debug screenshot storage (in-memory with TTL)
@@ -155,7 +157,7 @@ class AuthSessionManager {
     return crypto.randomUUID();
   }
 
-  createAuthSession(sessionId: string): string {
+  createAuthSession(sessionId: string, timeoutMs?: number): string {
     const authSessionId = this.generateAuthSessionId();
     this.authSessions.set(authSessionId, {
       authSessionId,
@@ -166,7 +168,10 @@ class AuthSessionManager {
       status: 'awaiting_scan',
       qrCodeData: null,
       sessionData: null,
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      // v1.1.3login: per-session timeout — QR sessions use AUTH_TIMEOUT_MS, portal sessions use portalTimeoutMs
+      timeoutMs: timeoutMs !== undefined ? timeoutMs : this.AUTH_TIMEOUT_MS,
+      portalSessionUrl: null
     });
     return authSessionId;
   }
@@ -192,7 +197,9 @@ class AuthSessionManager {
     const expired: string[] = [];
 
     for (const [authSessionId, session] of this.authSessions.entries()) {
-      if (now - session.startedAt > this.AUTH_TIMEOUT_MS) {
+      // v1.1.3login: use per-session timeout (QR=AUTH_TIMEOUT_MS, portal=portalTimeoutMs)
+      const sessionTimeoutMs = session.timeoutMs !== undefined ? session.timeoutMs : this.AUTH_TIMEOUT_MS;
+      if (now - session.startedAt > sessionTimeoutMs) {
         expired.push(authSessionId);
       }
     }
@@ -446,6 +453,50 @@ let sessionManager: SessionManager | null = null;
 let authSessionManager: AuthSessionManager | null = null;
 let moduleLoader: any = null;
 
+// v1.1.3login: In-memory portal session token store (single-use, time-limited)
+interface PortalSessionToken {
+  authSessionId: string;
+  containerId: string | null;
+  createdAt: number;
+  expiresAt: number;
+  used: boolean;
+}
+const portalSessionTokens = new Map<string, PortalSessionToken>();
+
+// v1.1.3login: Per-container Neko credential store (set at container creation in browser-manager.ts)
+// Populated via POST /internal/container-neko-creds when browser-manager creates a container
+interface NekoCredentials {
+  userPassword: string;
+  adminPassword: string;
+}
+const containerNekoCreds = new Map<string, NekoCredentials>();
+const containerNekoApiTokens = new Map<string, string>();
+
+// Retrieve container IP from browser-manager
+async function getContainerIp(containerId: string): Promise<string | null> {
+  try {
+    const bmUrl = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
+    const resp = await fetch(`${bmUrl}/stats`);
+    if (!resp.ok) return null;
+    // Fall back to Docker inspect if needed
+    const { execAsync: _exec } = await import('child_process').then(m => ({ execAsync: (cmd: string) => new Promise<{stdout: string}>((res, rej) => m.exec(cmd, (err, stdout) => err ? rej(err) : res({ stdout }))) }));
+    const { stdout } = await _exec(`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${containerId}`);
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+// Cleanup expired portal session tokens every minute
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of portalSessionTokens.entries()) {
+    if (now > data.expiresAt) {
+      portalSessionTokens.delete(token);
+    }
+  }
+}, 60000);
+
 async function initDStack(): Promise<void> {
   try {
     const { DstackClient } = require('@phala/dstack-sdk');
@@ -582,21 +633,40 @@ app.get('/sessions', (req, res) => {
 app.post('/auth/start/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const { preAuthToken } = req.body;  // 🔥 NEW: Accept pre-auth token for TEE integration
+    // v1.1.3login: accept portalMode, portalTimeoutMs, portalLoginUrl in addition to preAuthToken
+    const {
+      preAuthToken,
+      portalMode,
+      portalTimeoutMs: rawPortalTimeoutMs,
+      portalLoginUrl
+    } = req.body;
 
     if (!authSessionManager) {
       return res.status(500).json({ error: 'Auth session manager not initialized' });
     }
+
+    // v1.1.3login: portal mode — validate and resolve timeout
+    const isPortalMode = !!portalMode;
+    const DEFAULT_PORTAL_TIMEOUT_MS = 300000; // 5 minutes
+    const portalTimeoutMs = isPortalMode
+      ? (rawPortalTimeoutMs && Number.isFinite(Number(rawPortalTimeoutMs)) && Number(rawPortalTimeoutMs) > 0
+          ? Number(rawPortalTimeoutMs)
+          : DEFAULT_PORTAL_TIMEOUT_MS)
+      : 0;
 
     if (preAuthToken) {
       console.log(`🔐 Starting TEE-integrated authentication for session ${sessionId.substring(0, 8)}... (pre-auth token provided)`);
     } else {
       console.log(`🔐 Starting legacy authentication for session ${sessionId.substring(0, 8)}... (no pre-auth token)`);
     }
-    log.ok('AUTH', 'auth_started', { session: sessionId.substring(0, 8) });
+    if (isPortalMode) {
+      console.log(`🌐 Portal mode enabled for session ${sessionId.substring(0, 8)}... (timeout: ${portalTimeoutMs}ms)`);
+    }
+    log.ok('AUTH', 'auth_started', { session: sessionId.substring(0, 8), mode: isPortalMode ? 'portal' : 'qr' });
 
-    // Create auth session
-    const authSessionId = authSessionManager.createAuthSession(sessionId);
+    // Create auth session with per-session timeout
+    const authSessionTimeoutMs = isPortalMode ? portalTimeoutMs : undefined;
+    const authSessionId = authSessionManager.createAuthSession(sessionId, authSessionTimeoutMs);
 
     // Start authentication flow asynchronously
     (async () => {
@@ -614,6 +684,56 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         });
 
         const authPage = browserInstance.page;
+
+        // v1.1.3login: Portal mode branch — skip QR, navigate to email login, start cookie-only detection
+        if (isPortalMode) {
+          const loginUrl = portalLoginUrl
+            || process.env.PORTAL_LOGIN_URL
+            || 'https://www.tiktok.com/login/phone-or-email/email';
+
+          console.log(`🌐 Portal mode: navigating to ${loginUrl} for ${authSessionId.substring(0, 8)}...`);
+          await authPage.goto(loginUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          console.log(`✅ Portal login page loaded for ${authSessionId.substring(0, 8)}...`);
+
+          // Generate one-time session token (256-bit random, maps to container Neko credentials)
+          const sessionToken = crypto.randomBytes(32).toString('hex');
+
+          // Build portal URL: auth proxy on tokscope API port 3000
+          // Format: https://{app-id}-3000.{dstack-gateway}/auth/portal/{SESSION_TOKEN}
+          const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+          let portalSessionUrl: string;
+          if (dstackGateway) {
+            portalSessionUrl = `${dstackGateway}/auth/portal/${sessionToken}`;
+          } else {
+            // Fallback for non-Dstack environments: use local URL
+            const localPort = process.env.PORT || '3000';
+            portalSessionUrl = `http://localhost:${localPort}/auth/portal/${sessionToken}`;
+          }
+
+          // Store session token in-memory for auth proxy validation (single-use, time-limited)
+          portalSessionTokens.set(sessionToken, {
+            authSessionId,
+            containerId: browserInstance.containerId,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + portalTimeoutMs,
+            used: false
+          });
+
+          // Store portal URL in auth session for polling
+          authSessionManager.updateAuthSession(authSessionId, {
+            portalSessionUrl
+          });
+
+          console.log(`🔑 Portal session token generated for ${authSessionId.substring(0, 8)}...`);
+
+          // Start cookie-only detection loop (no URL-change dependency)
+          await waitForPortalLoginCompletion(authSessionId, authPage, preAuthToken, portalTimeoutMs);
+
+          return; // Portal flow complete — do not fall through to QR flow
+        }
 
         // v1.1.3F2: Navigate from pre-loaded tiktok.com → /login/qrcode (same-origin, fast)
         const navStart = Date.now();
@@ -1106,6 +1226,69 @@ async function extractAuthData(page: Page): Promise<SessionData> {
   return await BrowserAutomationClient.extractAuthData(page);
 }
 
+/**
+ * v1.1.3login: Cookie-only detection loop for portal mode
+ * CDP automation is read-only (no navigation/interaction) — human drives via Neko WebRTC
+ * Polls page.context().cookies() every 3s for the required 6-cookie set
+ */
+async function waitForPortalLoginCompletion(
+  authSessionId: string,
+  page: Page,
+  preAuthToken?: string,
+  portalTimeoutMs: number = 300000
+): Promise<void> {
+  const startTime = Date.now();
+  const requiredCookies = ['sessionid', 'msToken', 'ttwid', 'sid_guard', 'uid_tt', 'sid_tt'];
+  const POLL_INTERVAL_MS = 3000;
+
+  console.log(`⏳ Portal mode: waiting for cookie arrival for auth ${authSessionId.substring(0, 8)}... (timeout: ${portalTimeoutMs}ms)`);
+
+  while (Date.now() - startTime < portalTimeoutMs) {
+    try {
+      const cookies = await page.context().cookies();
+      const cookieNames = new Set(cookies.map((c: any) => c.name));
+      const foundRequired = requiredCookies.filter(name => cookieNames.has(name));
+
+      if (foundRequired.length === requiredCookies.length) {
+        console.log(`✅ Portal: all required cookies detected for ${authSessionId.substring(0, 8)}...`);
+
+        // Extract full auth data and store with TEE encryption (same path as QR flow)
+        const sessionData = await extractAuthData(page);
+
+        if (preAuthToken) {
+          await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
+        }
+
+        authSessionManager!.updateAuthSession(authSessionId, {
+          status: 'complete',
+          sessionData
+        });
+
+        // Destroy container
+        await destroyAuthContainer(authSessionId);
+        log.ok('AUTH', 'auth_complete', { session: authSessionId.substring(0, 8), mode: 'portal', duration: `${Date.now() - startTime}ms` });
+        return;
+      }
+
+      // Log progress periodically (every 30s)
+      if ((Date.now() - startTime) % 30000 < POLL_INTERVAL_MS) {
+        console.log(`⏳ Portal ${authSessionId.substring(0, 8)}: ${foundRequired.length}/${requiredCookies.length} cookies (${foundRequired.join(',')})`);
+      }
+
+    } catch (pollError: any) {
+      console.error(`⚠️ Portal cookie poll error for ${authSessionId.substring(0, 8)}: ${pollError.message}`);
+    }
+
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+  }
+
+  // Timeout — clean up
+  console.log(`⏰ Portal session timed out for ${authSessionId.substring(0, 8)}...`);
+  log.fail('AUTH', 'auth_timeout', { session: authSessionId.substring(0, 8), mode: 'portal', duration: `${portalTimeoutMs}ms` });
+  authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
+  await destroyAuthContainer(authSessionId);
+}
+
 
 app.get('/auth/poll/:authSessionId', (req, res) => {
   try {
@@ -1121,15 +1304,21 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
     }
 
     if (authSession.status === 'awaiting_scan') {
-      res.json({
+      // v1.1.3login: Include portalUrl in poll response when available (for borgcube to relay to 3P)
+      const pollResponse: any = {
         status: 'awaiting_scan',
         qrCodeData: authSession.qrCodeData,
         qrDecodedUrl: authSession.qrDecodedUrl  // Include magic link
-      });
+      };
+      if (authSession.portalSessionUrl) {
+        pollResponse.portalUrl = authSession.portalSessionUrl;
+      }
+      res.json(pollResponse);
     } else if (authSession.status === 'complete') {
+      // v1.1.3login: Remove sessionData from complete response — borgcube never reads it
+      // (verified: borgcube only reads qrCodeData/qrDecodedUrl, detects completion via auth_sessions DB)
       res.json({
-        status: 'complete',
-        sessionData: authSession.sessionData
+        status: 'complete'
       });
 
       // Clean up auth session after successful poll
@@ -1159,6 +1348,151 @@ app.post('/auth/destroy/:authSessionId', async (req, res) => {
     res.json({ ok: true });
   } catch (error: any) {
     console.error('Auth destroy error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * v1.1.3login: Auth proxy endpoint for WebRTC portal access
+ * Validates one-time session token, calls Neko's POST /api/login server-side to get
+ * NEKO_SESSION cookie, and redirects to Neko with ?embed=1 (no credentials in URL).
+ * Token is invalidated after first use (single-viewer enforcement layer 1).
+ */
+app.get('/auth/portal/:sessionToken', async (req, res) => {
+  try {
+    const { sessionToken } = req.params;
+
+    // Validate token
+    const tokenData = portalSessionTokens.get(sessionToken);
+    if (!tokenData) {
+      return res.status(404).json({ error: 'Portal session not found or expired' });
+    }
+
+    if (tokenData.used) {
+      return res.status(403).json({ error: 'Portal session token already used — single-use enforcement' });
+    }
+
+    if (Date.now() > tokenData.expiresAt) {
+      portalSessionTokens.delete(sessionToken);
+      return res.status(403).json({ error: 'Portal session token expired' });
+    }
+
+    // Invalidate token immediately (single-use — layer 1 of single-viewer enforcement)
+    tokenData.used = true;
+    console.log(`🔑 Portal token validated for auth ${tokenData.authSessionId.substring(0, 8)}...`);
+
+    // Get the auth session to retrieve container info
+    if (!authSessionManager) {
+      return res.status(500).json({ error: 'Auth session manager not initialized' });
+    }
+    const authSession = authSessionManager.getAuthSession(tokenData.authSessionId);
+    if (!authSession || !authSession.containerId) {
+      return res.status(404).json({ error: 'Portal session container not found' });
+    }
+
+    // Get container IP from browser manager to call Neko API server-side
+    // Neko runs on port 8080 inside the container
+    const containerIp = await getContainerIp(authSession.containerId);
+    if (!containerIp) {
+      return res.status(500).json({ error: 'Could not resolve container IP' });
+    }
+
+    const nekoBaseUrl = `http://${containerIp}:8080`;
+    const nekoApiToken = containerNekoApiTokens.get(authSession.containerId);
+
+    // Build Neko credentials (retrieved from container metadata)
+    const nekoCreds = containerNekoCreds.get(authSession.containerId);
+    if (!nekoCreds) {
+      console.warn(`⚠️ No Neko credentials found for container ${authSession.containerId.substring(0, 16)}, falling back to URL params`);
+      // Fallback: redirect with credentials in URL params (less secure but functional)
+      const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+      const nekoPublicUrl = dstackGateway
+        ? `${dstackGateway.replace('-3000.', '-8080.')}`
+        : `http://${containerIp}:8080`;
+      return res.redirect(`${nekoPublicUrl}/?embed=1`);
+    }
+
+    // Call Neko POST /api/login server-side to get NEKO_SESSION cookie
+    // This eliminates credentials from the redirect URL entirely
+    let nekoSessionCookie: string | null = null;
+    try {
+      const loginHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (nekoApiToken) {
+        loginHeaders['Authorization'] = `Bearer ${nekoApiToken}`;
+      }
+      const loginResp = await fetch(`${nekoBaseUrl}/api/login`, {
+        method: 'POST',
+        headers: loginHeaders,
+        body: JSON.stringify({ username: nekoCreds.userPassword ? 'user' : 'admin', password: nekoCreds.userPassword || nekoCreds.adminPassword })
+      });
+
+      if (loginResp.ok) {
+        const setCookieHeader = loginResp.headers.get('set-cookie');
+        if (setCookieHeader) {
+          nekoSessionCookie = setCookieHeader;
+          console.log(`✅ Neko session cookie obtained for ${tokenData.authSessionId.substring(0, 8)}...`);
+        }
+      } else {
+        console.warn(`⚠️ Neko /api/login returned ${loginResp.status} for ${tokenData.authSessionId.substring(0, 8)}`);
+      }
+    } catch (nekoErr: any) {
+      console.warn(`⚠️ Failed to call Neko /api/login: ${nekoErr.message}`);
+    }
+
+    // Build redirect URL to Neko with embed=1 (no credentials)
+    const dstackGateway = process.env.DSTACK_GATEWAY_URL || '';
+    let nekoPublicUrl: string;
+    if (dstackGateway) {
+      // Replace port 3000 with 8080 in Dstack gateway URL
+      nekoPublicUrl = dstackGateway.replace(/-3000\./, '-8080.');
+    } else {
+      nekoPublicUrl = `http://${containerIp}:8080`;
+    }
+    const redirectUrl = `${nekoPublicUrl}/?embed=1`;
+
+    if (nekoSessionCookie) {
+      // Set NEKO_SESSION cookie on redirect (cross-subdomain requires NEKO_SESSION_COOKIE_DOMAIN)
+      const cookieDomain = process.env.NEKO_SESSION_COOKIE_DOMAIN || '';
+      const cookieAttrs = cookieDomain ? `; Domain=${cookieDomain}; Path=/; SameSite=Lax` : `; Path=/; SameSite=Lax`;
+      res.setHeader('Set-Cookie', nekoSessionCookie.replace(/;.*$/, '') + cookieAttrs);
+    }
+
+    // Lock logins via Neko admin API (layer 2 of single-viewer enforcement)
+    if (nekoApiToken) {
+      fetch(`${nekoBaseUrl}/api/room/settings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${nekoApiToken}`
+        },
+        body: JSON.stringify({ locked_logins: true })
+      }).catch((err: any) => {
+        console.warn(`⚠️ Failed to lock Neko logins for ${tokenData.authSessionId.substring(0, 8)}: ${err.message}`);
+      });
+    }
+
+    res.redirect(302, redirectUrl);
+
+  } catch (error: any) {
+    console.error('Auth portal error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// v1.1.3login: Internal endpoint for browser-manager to register per-container Neko credentials
+// Called by browser-manager.ts after container creation with randomized Neko creds
+app.post('/internal/container-neko-creds', (req, res) => {
+  try {
+    const { containerId, userPassword, adminPassword, apiToken } = req.body;
+    if (!containerId || !userPassword || !adminPassword) {
+      return res.status(400).json({ error: 'containerId, userPassword, adminPassword required' });
+    }
+    containerNekoCreds.set(containerId, { userPassword, adminPassword });
+    if (apiToken) {
+      containerNekoApiTokens.set(containerId, apiToken);
+    }
+    res.json({ ok: true });
+  } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
