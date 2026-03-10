@@ -4,6 +4,7 @@ const execAsync = promisify(exec);
 // v3-v: Removed Playwright - browser-manager is Docker lifecycle only
 // tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
+import * as cryptoModule from 'crypto';
 import { log } from './lib/log';
 
 // Configuration
@@ -25,6 +26,10 @@ interface ContainerInfo {
   lastUsed: number;
   status: 'pooled' | 'assigned' | 'released';
   sessionId: string | null;
+  // v1.1.3login: Per-container randomized Neko credentials (zero impact on CDP/QR automation flow)
+  nekoUserPassword: string;
+  nekoAdminPassword: string;
+  nekoApiToken: string;
 }
 
 class BrowserManager {
@@ -107,6 +112,12 @@ class BrowserManager {
         }
       }
 
+      // v1.1.3login: Generate unique random Neko credentials per container at creation time
+      // These are independent of CDP automation (CDP connects to port 9223, Neko uses port 8080)
+      const nekoUserPassword = cryptoModule.randomBytes(16).toString('hex');    // 32 hex chars
+      const nekoAdminPassword = cryptoModule.randomBytes(16).toString('hex');   // 32 hex chars
+      const nekoApiToken = cryptoModule.randomBytes(24).toString('hex');        // 48 hex chars (admin API)
+
       // Don't use static IPs - let Docker assign them automatically
       // xordi-network doesn't have user-configured subnet
       const dockerCmd = [
@@ -117,6 +128,10 @@ class BrowserManager {
         '--env', `CONTAINER_NAME=${containerId}`,
         '--env', `NEKO_DESKTOP_SCREEN=${process.env.NEKO_DESKTOP_SCREEN || '1920x1080@30'}`,
         '--env', `NEKO_DESKTOP_SCALING=${process.env.NEKO_DESKTOP_SCALING || '1.0'}`,
+        // v1.1.3login: Randomized Neko credentials (no default passwords; portal mode uses these)
+        '--env', `NEKO_MEMBER_MULTIUSER_USER_PASSWORD=${nekoUserPassword}`,
+        '--env', `NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=${nekoAdminPassword}`,
+        '--env', `NEKO_SESSION_API_TOKEN=${nekoApiToken}`,
         '--restart', 'no'
       ];
 
@@ -203,7 +218,11 @@ class BrowserManager {
         createdAt: Date.now(),
         lastUsed: Date.now(),
         status: 'pooled',
-        sessionId: null
+        sessionId: null,
+        // v1.1.3login: Store randomized Neko credentials in container metadata
+        nekoUserPassword,
+        nekoAdminPassword,
+        nekoApiToken
       };
 
       console.log(`✅ Container ${containerId.substring(0, 16)}... ready (awaiting CDP from server.ts)`);
@@ -218,6 +237,22 @@ class BrowserManager {
 
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
+
+      // v1.1.3login: Register Neko credentials with server.ts for portal auth proxy
+      // Best-effort — failure is non-fatal (portal mode unavailable for this container)
+      const enclaveApiUrl = `http://localhost:${process.env.PORT || '3000'}`;
+      fetch(`${enclaveApiUrl}/internal/container-neko-creds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          containerId,
+          userPassword: nekoUserPassword,
+          adminPassword: nekoAdminPassword,
+          apiToken: nekoApiToken
+        })
+      }).catch((err: any) => {
+        console.warn(`⚠️ Failed to register Neko creds for ${containerId.substring(0, 16)}: ${err.message}`);
+      });
 
       const createDuration = Date.now() - containerInfo.createdAt;
       log.ok('BROWSER', 'container_created', { id: shortContainerId, pool_size: this.containerPool.length, duration: `${createDuration}ms` });
