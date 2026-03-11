@@ -6,7 +6,8 @@ services:
     container_name: tokscope-enclave
     hostname: tokscope-enclave
     ports:
-      - "3000:3000"  # Enclave API endpoint
+      - "3000:3000"    # existing — tokscope API
+      - "6080:6080"    # v1.1.3combo3 — VNC WebSocket proxy (portal mode)
     restart: "no"
     environment:
       - WEB_AUTH_MODULE_URL=${WEB_AUTH_MODULE_URL}

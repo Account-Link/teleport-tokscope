@@ -2,6 +2,7 @@ import express from 'express';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as net from 'net';
 import jsQR from 'jsqr';
 import { log } from './lib/log';
 import { Jimp } from 'jimp';
@@ -50,6 +51,7 @@ interface BrowserInstance {
   page: Page;
   containerId: string;
   cdpUrl: string;
+  containerIp: string;   // v1.1.3combo3: for VNC TCP proxy
 }
 
 interface Config {
@@ -230,9 +232,8 @@ class AuthSessionManager {
  * This is the fix for the dual CDP connection bug (Solution F)
  * browser-manager only manages Docker lifecycle, we own CDP/context/page
  */
-async function requestBrowserInstance(sessionId: string, portalMode: boolean = false): Promise<BrowserInstance> {
-  // v1.1.3combo2: portal mode uses on-demand container with host port publishing (/assign-portal)
-  const assignPath = portalMode ? `assign-portal/${sessionId}` : `assign/${sessionId}`;
+async function requestBrowserInstance(sessionId: string): Promise<BrowserInstance> {
+  const assignPath = `assign/${sessionId}`;
   console.log(`🔄 Requesting browser instance from ${BROWSER_MANAGER_URL}/${assignPath}`);
   const response = await fetch(`${BROWSER_MANAGER_URL}/${assignPath}`, {
     method: 'POST'
@@ -346,7 +347,8 @@ async function requestBrowserInstance(sessionId: string, portalMode: boolean = f
     context: context!,
     page: page!,
     containerId: result.container.containerId,
-    cdpUrl: result.container.cdpUrl
+    cdpUrl: result.container.cdpUrl,
+    containerIp: result.container.ip   // v1.1.3combo3
   };
 }
 
@@ -463,17 +465,9 @@ interface PortalSessionToken {
   createdAt: number;
   expiresAt: number;
   used: boolean;
+  gatewayUrl?: string;   // v1.1.3combo3: stored at mint time for noVNC redirect
 }
 const portalSessionTokens = new Map<string, PortalSessionToken>();
-
-// v1.1.3login: Per-container Neko credential store (set at container creation in browser-manager.ts)
-// Populated via POST /internal/container-neko-creds when browser-manager creates a container
-interface NekoCredentials {
-  userPassword: string;
-  adminPassword: string;
-}
-const containerNekoCreds = new Map<string, NekoCredentials>();
-const containerNekoApiTokens = new Map<string, string>();
 
 // Retrieve container IP from browser-manager
 async function getContainerIp(containerId: string): Promise<string | null> {
@@ -488,6 +482,47 @@ async function getContainerIp(containerId: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// v1.1.3combo3: TCP proxy state for portal VNC access
+let activePortalProxy: {
+  sessionId: string;
+  containerId: string;
+  containerIp: string;
+  server: net.Server;
+} | null = null;
+
+function startPortalProxy(containerId: string, containerIp: string, sessionId: string): void {
+  if (activePortalProxy) {
+    console.warn(`⚠️ Portal proxy already active for session ${activePortalProxy.sessionId.substring(0, 8)}, stopping first`);
+    stopPortalProxy();
+  }
+
+  const server = net.createServer((clientSocket) => {
+    const upstream = net.connect(6080, containerIp, () => {
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+    });
+    upstream.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => upstream.destroy());
+  });
+
+  server.listen(6080, '0.0.0.0', () => {
+    console.log(`🌐 Portal VNC proxy: 0.0.0.0:6080 → ${containerIp}:6080 (websockify → x11vnc)`);
+  });
+
+  server.on('error', (err: any) => {
+    console.error(`❌ Portal VNC proxy error: ${err.message}`);
+  });
+
+  activePortalProxy = { sessionId, containerId, containerIp, server };
+}
+
+function stopPortalProxy(): void {
+  if (!activePortalProxy) return;
+  console.log(`🔌 Stopping portal VNC proxy for session ${activePortalProxy.sessionId.substring(0, 8)}`);
+  activePortalProxy.server.close();
+  activePortalProxy = null;
 }
 
 // Cleanup expired portal session tokens every minute
@@ -679,8 +714,7 @@ app.post('/auth/start/:sessionId', async (req, res) => {
       try {
         // v3-v: Request browser container - NOW INCLUDES context/page creation
         // This is the Solution F fix: single CDP connection owns everything
-        // v1.1.3combo2: portal mode uses /assign-portal (on-demand, with port publishing)
-        browserInstance = await requestBrowserInstance(authSessionId, isPortalMode);
+        browserInstance = await requestBrowserInstance(authSessionId);
 
         authSessionManager.updateAuthSession(authSessionId, {
           containerId: browserInstance.containerId,
@@ -725,7 +759,8 @@ app.post('/auth/start/:sessionId', async (req, res) => {
             containerId: browserInstance.containerId,
             createdAt: Date.now(),
             expiresAt: Date.now() + portalTimeoutMs,
-            used: false
+            used: false,
+            gatewayUrl: dstackGateway   // v1.1.3combo3: stored at mint time for noVNC redirect
           });
 
           // Store portal URL in auth session for polling
@@ -734,6 +769,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           });
 
           console.log(`🔑 Portal session token generated for ${authSessionId.substring(0, 8)}...`);
+
+          // v1.1.3combo3: Start VNC TCP proxy to this container
+          startPortalProxy(browserInstance.containerId, browserInstance.containerIp, authSessionId);
 
           // Start cookie-only detection loop (no URL-change dependency)
           await waitForPortalLoginCompletion(authSessionId, authPage, preAuthToken, portalTimeoutMs);
@@ -1271,6 +1309,7 @@ async function waitForPortalLoginCompletion(
         });
 
         // Destroy container
+        stopPortalProxy();  // v1.1.3combo3: tear down VNC proxy
         await destroyAuthContainer(authSessionId);
         log.ok('AUTH', 'auth_complete', { session: authSessionId.substring(0, 8), mode: 'portal', duration: `${Date.now() - startTime}ms` });
         return;
@@ -1291,6 +1330,7 @@ async function waitForPortalLoginCompletion(
   // Timeout — clean up
   console.log(`⏰ Portal session timed out for ${authSessionId.substring(0, 8)}...`);
   log.fail('AUTH', 'auth_timeout', { session: authSessionId.substring(0, 8), mode: 'portal', duration: `${portalTimeoutMs}ms` });
+  stopPortalProxy();  // v1.1.3combo3: tear down VNC proxy
   authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
   await destroyAuthContainer(authSessionId);
 }
@@ -1359,146 +1399,52 @@ app.post('/auth/destroy/:authSessionId', async (req, res) => {
 });
 
 /**
- * v1.1.3login: Auth proxy endpoint for WebRTC portal access
- * Validates one-time session token, calls Neko's POST /api/login server-side to get
- * NEKO_SESSION cookie, and redirects to Neko with ?embed=1 (no credentials in URL).
- * Token is invalidated after first use (single-viewer enforcement layer 1).
+ * v1.1.3combo3: Auth portal endpoint — validates one-time token, redirects to noVNC.
+ * Token is invalidated after first use (single-use enforcement).
+ * VNC access is gated by TCP proxy lifecycle — no session = port 6080 not listening.
  */
 app.get('/auth/portal/:sessionToken', async (req, res) => {
   try {
     const { sessionToken } = req.params;
 
-    // Validate token
+    // Validate token (unchanged from v1.1.3login)
     const tokenData = portalSessionTokens.get(sessionToken);
     if (!tokenData) {
       return res.status(404).json({ error: 'Portal session not found or expired' });
     }
-
     if (tokenData.used) {
       return res.status(403).json({ error: 'Portal session token already used — single-use enforcement' });
     }
-
     if (Date.now() > tokenData.expiresAt) {
       portalSessionTokens.delete(sessionToken);
       return res.status(403).json({ error: 'Portal session token expired' });
     }
 
-    // Invalidate token immediately (single-use — layer 1 of single-viewer enforcement)
+    // Invalidate token immediately (single-use)
     tokenData.used = true;
     console.log(`🔑 Portal token validated for auth ${tokenData.authSessionId.substring(0, 8)}...`);
 
-    // Get the auth session to retrieve container info
-    if (!authSessionManager) {
-      return res.status(500).json({ error: 'Auth session manager not initialized' });
-    }
-    const authSession = authSessionManager.getAuthSession(tokenData.authSessionId);
-    if (!authSession || !authSession.containerId) {
-      return res.status(404).json({ error: 'Portal session container not found' });
-    }
-
-    // Get container IP from browser manager to call Neko API server-side
-    // Neko runs on port 8080 inside the container
-    const containerIp = await getContainerIp(authSession.containerId);
-    if (!containerIp) {
-      return res.status(500).json({ error: 'Could not resolve container IP' });
-    }
-
-    const nekoBaseUrl = `http://${containerIp}:8080`;
-    const nekoApiToken = containerNekoApiTokens.get(authSession.containerId);
-
-    // Build Neko credentials (retrieved from container metadata)
-    const nekoCreds = containerNekoCreds.get(authSession.containerId);
-    if (!nekoCreds) {
-      console.warn(`⚠️ No Neko credentials found for container ${authSession.containerId.substring(0, 16)}, falling back to URL params`);
-      // Fallback: redirect with credentials in URL params (less secure but functional)
-      const dstackGateway = process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
-      const nekoPublicUrl = dstackGateway
-        ? `${dstackGateway.replace('-3000.', '-8080.')}`
-        : `http://${containerIp}:8080`;
-      return res.redirect(`${nekoPublicUrl}/?embed=1`);
-    }
-
-    // Call Neko POST /api/login server-side to get NEKO_SESSION cookie
-    // This eliminates credentials from the redirect URL entirely
-    let nekoSessionCookie: string | null = null;
-    try {
-      const loginHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (nekoApiToken) {
-        loginHeaders['Authorization'] = `Bearer ${nekoApiToken}`;
-      }
-      const loginResp = await fetch(`${nekoBaseUrl}/api/login`, {
-        method: 'POST',
-        headers: loginHeaders,
-        body: JSON.stringify({ username: nekoCreds.userPassword ? 'user' : 'admin', password: nekoCreds.userPassword || nekoCreds.adminPassword })
-      });
-
-      if (loginResp.ok) {
-        const setCookieHeader = loginResp.headers.get('set-cookie');
-        if (setCookieHeader) {
-          nekoSessionCookie = setCookieHeader;
-          console.log(`✅ Neko session cookie obtained for ${tokenData.authSessionId.substring(0, 8)}...`);
-        }
-      } else {
-        console.warn(`⚠️ Neko /api/login returned ${loginResp.status} for ${tokenData.authSessionId.substring(0, 8)}`);
-      }
-    } catch (nekoErr: any) {
-      console.warn(`⚠️ Failed to call Neko /api/login: ${nekoErr.message}`);
-    }
-
-    // Build redirect URL to Neko with embed=1 (no credentials)
-    const dstackGateway = process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
-    let nekoPublicUrl: string;
+    // v1.1.3combo3: Redirect to noVNC (VNC-over-WebSocket) instead of Neko WebRTC
+    // Port 6080 on tokscope-enclave is TCP-proxied to the browser container's websockify
+    // R4/B3: Use gateway URL stored with the token (survives process restart)
+    const dstackGateway = tokenData.gatewayUrl || process.env.DSTACK_GATEWAY_URL || lastKnownGatewayUrl;
+    let noVncUrl: string;
     if (dstackGateway) {
-      // Replace port 3000 with 8080 in Dstack gateway URL
-      nekoPublicUrl = dstackGateway.replace(/-3000\./, '-8080.');
+      // Replace -3000. with -6080. in gateway URL
+      noVncUrl = dstackGateway.replace(/-3000\./, '-6080.');
     } else {
-      nekoPublicUrl = `http://${containerIp}:8080`;
-    }
-    const redirectUrl = `${nekoPublicUrl}/?embed=1`;
-
-    if (nekoSessionCookie) {
-      // Set NEKO_SESSION cookie on redirect (cross-subdomain requires NEKO_SESSION_COOKIE_DOMAIN)
-      const cookieDomain = process.env.NEKO_SESSION_COOKIE_DOMAIN || '';
-      const cookieAttrs = cookieDomain ? `; Domain=${cookieDomain}; Path=/; SameSite=Lax` : `; Path=/; SameSite=Lax`;
-      res.setHeader('Set-Cookie', nekoSessionCookie.replace(/;.*$/, '') + cookieAttrs);
+      noVncUrl = `http://localhost:6080`;
     }
 
-    // Lock logins via Neko admin API (layer 2 of single-viewer enforcement)
-    if (nekoApiToken) {
-      fetch(`${nekoBaseUrl}/api/room/settings`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${nekoApiToken}`
-        },
-        body: JSON.stringify({ locked_logins: true })
-      }).catch((err: any) => {
-        console.warn(`⚠️ Failed to lock Neko logins for ${tokenData.authSessionId.substring(0, 8)}: ${err.message}`);
-      });
-    }
+    // noVNC URL params: autoconnect=true skips the connect dialog, resize=scale fits viewport
+    const redirectUrl = `${noVncUrl}/vnc.html?autoconnect=true&resize=scale`;
 
+    // No Neko login needed — VNC has no auth (x11vnc -nopw)
+    // No login locking needed — TCP proxy lifecycle IS the auth mechanism
     res.redirect(302, redirectUrl);
 
   } catch (error: any) {
     console.error('Auth portal error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// v1.1.3login: Internal endpoint for browser-manager to register per-container Neko credentials
-// Called by browser-manager.ts after container creation with randomized Neko creds
-app.post('/internal/container-neko-creds', (req, res) => {
-  try {
-    const { containerId, userPassword, adminPassword, apiToken } = req.body;
-    if (!containerId || !userPassword || !adminPassword) {
-      return res.status(400).json({ error: 'containerId, userPassword, adminPassword required' });
-    }
-    containerNekoCreds.set(containerId, { userPassword, adminPassword });
-    if (apiToken) {
-      containerNekoApiTokens.set(containerId, apiToken);
-    }
-    res.json({ ok: true });
-  } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
