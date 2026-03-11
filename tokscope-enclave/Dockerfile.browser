@@ -9,24 +9,17 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install coturn for TURN-over-TLS relay (portal mode only)
-RUN apt-get update && apt-get install -y --no-install-recommends coturn && rm -rf /var/lib/apt/lists/*
+# v1.1.3combo3: VNC-over-WebSocket stack for portal mode
+# x11vnc captures Xorg :99.0 → websockify bridges WS:6080 → noVNC client in browser
+# Both processes are inert (zero CPU) when no VNC client is connected
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends x11vnc novnc python3-pip && \
+    pip3 install --break-system-packages websockify && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Self-signed cert for TURN TLS (browser doesn't validate TURN certs per RFC 7065)
-RUN mkdir -p /etc/coturn/certs && \
-    openssl req -x509 -newkey rsa:2048 -keyout /etc/coturn/certs/turn.key \
-    -out /etc/coturn/certs/turn.crt -days 3650 -nodes \
-    -subj '/CN=turn-internal'
-
-# coturn supervisord drop-in (uses /etc/neko/supervisord/*.conf pattern)
-COPY tokscope-enclave/coturn-supervisor.conf /etc/neko/supervisord/coturn.conf
-
-# coturn startup wrapper (envsubst for config templating)
-COPY tokscope-enclave/start-coturn.sh /usr/local/bin/start-coturn.sh
-RUN chmod +x /usr/local/bin/start-coturn.sh
-
-# coturn config template (env vars resolved at runtime by start-coturn.sh)
-COPY tokscope-enclave/turnserver.conf.template /etc/coturn/turnserver.conf.template
+# VNC supervisord configs
+COPY tokscope-enclave/x11vnc.conf /etc/neko/supervisord/x11vnc.conf
+COPY tokscope-enclave/websockify.conf /etc/neko/supervisord/websockify.conf
 
 # Copy configuration files
 COPY ${CHROMIUM_CONF_SOURCE}/chromium.conf /etc/neko/supervisord/chromium.conf
