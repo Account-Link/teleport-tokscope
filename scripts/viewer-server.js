@@ -36,7 +36,7 @@ app.get('/', (req, res) => {
       const response = await fetch(NEKO_URL + '/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'neko', password: 'neko' })
+        body: JSON.stringify({ username: 'neko', password: '${process.env.NEKO_USER_PASSWORD || "neko"}' })
       });
       const data = await response.json();
       return data.token;

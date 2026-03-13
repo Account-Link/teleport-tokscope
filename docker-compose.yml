@@ -13,8 +13,8 @@ services:
       - CHROMIUM_PROXY_ARG=${SOCKS5_PROXY:+--proxy-server=socks5://127.0.0.1:1080}
       # Auth configuration
       - NEKO_MEMBER_PROVIDER=multiuser
-      - NEKO_MEMBER_MULTIUSER_USER_PASSWORD=neko
-      - NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=admin
+      - NEKO_MEMBER_MULTIUSER_USER_PASSWORD=${NEKO_USER_PASSWORD:-neko}
+      - NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=${NEKO_ADMIN_PASSWORD:-admin}
     ports:
       - "8080:8080"
       - "9223:9223"

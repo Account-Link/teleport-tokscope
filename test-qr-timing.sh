@@ -12,10 +12,10 @@ cd "$(dirname "$0")"
 
 MODE="${1:-both}"
 NETWORK="test-qr-network"
-WG_HOST="162.251.235.137"
-WG_PORT="10800"
-WG_USER="wgproxy"
-WG_PASS="f1f715aef373bb81aaf5c2043fd158e54b543f5f44c8cebe490ff48f801b4b5d"
+WG_HOST="${WG_HOST:?WG_HOST env var required}"
+WG_PORT="${WG_PORT:?WG_PORT env var required}"
+WG_USER="${WG_USER:?WG_USER env var required}"
+WG_PASS="${WG_PASS:?WG_PASS env var required}"
 IMAGE="xordi-staging-tcb-browser:latest"
 
 # Modified chromium.conf for v1.1.3F3
