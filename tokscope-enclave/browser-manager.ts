@@ -243,7 +243,7 @@ class BrowserManager {
       return containerId;
 
     } catch (error: any) {
-      log.fail('BROWSER', 'container_failed', { error: error.message, pool_size: this.containerPool.length });
+      log.fail('BROWSER', 'container_failed', { id: containerId.substring(0, 12), error: error.message, pool_size: this.containerPool.length });
 
       await execAsync(`docker rm -f ${containerId}`).catch(() => {});
 
@@ -538,7 +538,7 @@ class BrowserManager {
                   return containerId;
                 })
                 .catch((error: any) => {
-                  console.error(`❌ Failed to create maintenance container:`, error.message);
+                  log.fail('BROWSER', 'pool_create_failed', { error: error.message });
                   throw error;
                 })
             );
@@ -548,12 +548,16 @@ class BrowserManager {
           const results = await Promise.allSettled(creationPromises);
 
           const succeeded = results.filter(r => r.status === 'fulfilled').length;
-          const failed = results.filter(r => r.status === 'rejected').length;
+          const rejections = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
 
-          console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${failed} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE}`);
+          console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${rejections.length} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE}`);
+          if (rejections.length > 0) {
+            const reasons = [...new Set(rejections.map(r => r.reason?.message || 'unknown'))];
+            log.fail('BROWSER', 'pool_maintenance_failures', { count: rejections.length, reasons: reasons.join('; ') });
+          }
         }
       } catch (error: any) {
-        console.error('❌ Pool maintenance error:', error.message);
+        log.fail('BROWSER', 'pool_maintenance_error', { error: error.message });
       } finally {
         // UNLOCK: Allow next maintenance cycle
         this.isMaintenanceRunning = false;
