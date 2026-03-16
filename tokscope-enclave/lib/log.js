@@ -16,4 +16,10 @@ const log = {
   error: (component, event, data = {}) => console.log(format('ERROR', component, event, data)),
 };
 
-module.exports = { log };
+// Strip --env values from docker command errors to prevent secret leakage in logs.
+// Keeps the flag name visible (e.g. "--env NEKO_SESSION_API_TOKEN=***") for debugging.
+function sanitizeDockerError(msg) {
+  return msg.replace(/--env\s+(\w+)=\S+/g, '--env $1=***');
+}
+
+module.exports = { log, sanitizeDockerError };

@@ -5,7 +5,7 @@ const execAsync = promisify(exec);
 // tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
 import * as cryptoModule from 'crypto';
-import { log } from './lib/log';
+import { log, sanitizeDockerError } from './lib/log';
 
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
@@ -243,7 +243,7 @@ class BrowserManager {
       return containerId;
 
     } catch (error: any) {
-      log.fail('BROWSER', 'container_failed', { id: containerId.substring(0, 12), error: error.message, pool_size: this.containerPool.length });
+      log.fail('BROWSER', 'container_failed', { id: containerId.substring(0, 12), error: sanitizeDockerError(error.message), pool_size: this.containerPool.length });
 
       await execAsync(`docker rm -f ${containerId}`).catch(() => {});
 
@@ -538,7 +538,7 @@ class BrowserManager {
                   return containerId;
                 })
                 .catch((error: any) => {
-                  log.fail('BROWSER', 'pool_create_failed', { error: error.message });
+                  log.fail('BROWSER', 'pool_create_failed', { error: sanitizeDockerError(error.message) });
                   throw error;
                 })
             );
@@ -551,7 +551,7 @@ class BrowserManager {
           const rejections = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
 
           if (rejections.length > 0) {
-            const reasons = [...new Set(rejections.map(r => (r.reason?.message || 'unknown').split('\n')[0]))];
+            const reasons = [...new Set(rejections.map(r => sanitizeDockerError((r.reason?.message || 'unknown').split('\n')[0])))];
             console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${rejections.length} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE} reason=${reasons.join('; ')}`);
             log.fail('BROWSER', 'pool_maintenance_failures', { count: rejections.length, reasons: reasons.join('; ') });
           } else {
