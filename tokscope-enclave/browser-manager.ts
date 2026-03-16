@@ -550,10 +550,12 @@ class BrowserManager {
           const succeeded = results.filter(r => r.status === 'fulfilled').length;
           const rejections = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
 
-          console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${rejections.length} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE}`);
           if (rejections.length > 0) {
-            const reasons = [...new Set(rejections.map(r => r.reason?.message || 'unknown'))];
+            const reasons = [...new Set(rejections.map(r => (r.reason?.message || 'unknown').split('\n')[0]))];
+            console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${rejections.length} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE} reason=${reasons.join('; ')}`);
             log.fail('BROWSER', 'pool_maintenance_failures', { count: rejections.length, reasons: reasons.join('; ') });
+          } else {
+            console.log(`🎯 Pool maintenance complete: ${succeeded} created, ${rejections.length} failed. Pool size: ${this.containerPool.length}/${MIN_POOL_SIZE}`);
           }
         }
       } catch (error: any) {
