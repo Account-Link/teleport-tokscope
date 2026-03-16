@@ -5,7 +5,12 @@ const execAsync = promisify(exec);
 // tokscope-enclave (server.ts) now owns the single CDP connection
 import * as fs from 'fs';
 import * as cryptoModule from 'crypto';
-import { log, sanitizeDockerError } from './lib/log';
+import { log } from './lib/log';
+
+// Strip --env values from docker command errors to prevent secret leakage in logs.
+function sanitizeDockerError(msg: string): string {
+  return msg.replace(/--env\s+(\w+)=\S+/g, '--env $1=***');
+}
 
 // Configuration
 const MIN_POOL_SIZE = parseInt(process.env.MIN_POOL_SIZE || '6');
