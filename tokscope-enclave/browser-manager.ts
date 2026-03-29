@@ -494,10 +494,17 @@ class BrowserManager {
       const now = Date.now();
       const toDestroy: string[] = [];
 
+      const assignedTimeoutMs = 30 * 60 * 1000; // 30 min hard timeout for assigned containers
+
       for (const [containerId, containerInfo] of this.containers.entries()) {
-        // Only destroy 'released' containers (used and returned), NOT 'pooled' (warm pool)
+        // Destroy 'released' containers (used and returned), NOT 'pooled' (warm pool)
         if (containerInfo.status === 'released' && now - containerInfo.lastUsed > timeoutMs) {
-          log.ok('BROWSER', 'container_timeout', { id: containerId.substring(0, 12), idle_duration: `${Math.round((now - containerInfo.lastUsed) / 1000)}s` });
+          log.ok('BROWSER', 'container_timeout', { id: containerId.substring(0, 12), status: 'released', idle_duration: `${Math.round((now - containerInfo.lastUsed) / 1000)}s` });
+          toDestroy.push(containerId);
+        }
+        // Destroy 'assigned' containers stuck beyond 30 min (session crashed without release)
+        if (containerInfo.status === 'assigned' && now - containerInfo.lastUsed > assignedTimeoutMs) {
+          log.warn('BROWSER', 'container_orphaned', { id: containerId.substring(0, 12), session: containerInfo.sessionId?.substring(0, 8) || 'unknown', stuck_duration: `${Math.round((now - containerInfo.lastUsed) / 1000)}s` });
           toDestroy.push(containerId);
         }
       }

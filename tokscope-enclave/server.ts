@@ -1176,7 +1176,7 @@ async function storeUserWithTEEEncryption(sessionData: SessionData, preAuthToken
     const xordiApiKey = process.env.XORDI_API_KEY;
 
     if (!xordiApiKey) {
-      console.error('❌ XORDI_API_KEY not configured - cannot store user with TEE encryption');
+      log.fail('AUTH', 'tee_config_missing', { reason: 'XORDI_API_KEY not set' });
       return;
     }
 
