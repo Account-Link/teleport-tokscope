@@ -1508,7 +1508,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
       res.json(result);
 
     } finally {
-      try { await browser.close(); } catch {}
+      try { await browserInstance?.close(); } catch {}
       await releaseBrowserInstance(sessionId);
     }
 
@@ -1556,7 +1556,7 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
       res.json(result);
 
     } finally {
-      try { await browser.close(); } catch {}
+      try { await browserInstance?.close(); } catch {}
       await releaseBrowserInstance(sessionId);
     }
 
