@@ -500,11 +500,16 @@ function startPortalProxy(containerId: string, containerIp: string, sessionId: s
 
   const server = net.createServer((clientSocket) => {
     const upstream = net.connect(6080, containerIp, () => {
+      clearTimeout(connectTimeout);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     });
-    upstream.on('error', () => clientSocket.destroy());
-    clientSocket.on('error', () => upstream.destroy());
+    const connectTimeout = setTimeout(() => {
+      upstream.destroy();
+      clientSocket.destroy();
+    }, 5000);
+    upstream.on('error', () => { clearTimeout(connectTimeout); clientSocket.destroy(); });
+    clientSocket.on('error', () => { clearTimeout(connectTimeout); upstream.destroy(); });
   });
 
   server.listen(6080, '0.0.0.0', () => {
@@ -771,6 +776,9 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           console.log(`🔑 Portal session token generated for ${authSessionId.substring(0, 8)}...`);
 
           // v1.1.3combo3: Start VNC TCP proxy to this container
+          if (!browserInstance.containerIp) {
+            throw new Error(`Container IP not available for portal proxy: ${browserInstance.containerId}`);
+          }
           startPortalProxy(browserInstance.containerId, browserInstance.containerIp, authSessionId);
 
           // Start cookie-only detection loop (no URL-change dependency)
@@ -1284,6 +1292,7 @@ async function waitForPortalLoginCompletion(
   const startTime = Date.now();
   const requiredCookies = ['sessionid', 'msToken', 'ttwid', 'sid_guard', 'uid_tt', 'sid_tt'];
   const POLL_INTERVAL_MS = 3000;
+  let pollCount = 0;
 
   console.log(`⏳ Portal mode: waiting for cookie arrival for auth ${authSessionId.substring(0, 8)}... (timeout: ${portalTimeoutMs}ms)`);
 
@@ -1297,7 +1306,16 @@ async function waitForPortalLoginCompletion(
         console.log(`✅ Portal: all required cookies detected for ${authSessionId.substring(0, 8)}...`);
 
         // Extract full auth data and store with TEE encryption (same path as QR flow)
-        const sessionData = await extractAuthData(page);
+        let sessionData;
+        try {
+          sessionData = await extractAuthData(page);
+        } catch (extractError: any) {
+          console.error(`⚠️ Portal: extractAuthData failed: ${extractError.message}`);
+          authSessionManager!.updateAuthSession(authSessionId, { status: 'failed' });
+          stopPortalProxy();
+          await destroyAuthContainer(authSessionId);
+          return;
+        }
 
         if (preAuthToken) {
           await storeUserWithTEEEncryption(sessionData, preAuthToken, authSessionId);
@@ -1315,9 +1333,9 @@ async function waitForPortalLoginCompletion(
         return;
       }
 
-      // Log progress periodically (every 30s)
-      if ((Date.now() - startTime) % 30000 < POLL_INTERVAL_MS) {
-        console.log(`⏳ Portal ${authSessionId.substring(0, 8)}: ${foundRequired.length}/${requiredCookies.length} cookies (${foundRequired.join(',')})`);
+      // Log progress periodically (every ~30s)
+      if (++pollCount % 10 === 0) {
+        console.log(`⏳ Portal ${authSessionId.substring(0, 8)}: ${foundRequired.length}/${requiredCookies.length} cookies (${foundRequired.join(', ')})`);
       }
 
     } catch (pollError: any) {
@@ -1490,6 +1508,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
       res.json(result);
 
     } finally {
+      try { await browser.close(); } catch {}
       await releaseBrowserInstance(sessionId);
     }
 
@@ -1537,6 +1556,7 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
       res.json(result);
 
     } finally {
+      try { await browser.close(); } catch {}
       await releaseBrowserInstance(sessionId);
     }
 
@@ -2501,7 +2521,7 @@ app.post('/migrate/tee-to-tee-single', async (req, res) => {
     });
   } catch (error: any) {
     console.error(`tee-to-tee-single failed for ${req.body?.sec_user_id}:`, error.message);
-    res.json({
+    res.status(500).json({
       success: false,
       sec_user_id: req.body?.sec_user_id,
       error: error.message
@@ -2604,9 +2624,24 @@ app.get('/debug/screenshots/:authSessionId', (req, res) => {
   res.json({ authSessionId, count: screenshots.length, screenshots });
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
+app.get('/health', async (req, res) => {
+  let bmHealthy = false;
+  let bmPool = 0;
+  try {
+    const bmResp = await fetch(`${BROWSER_MANAGER_URL}/stats`, {
+      signal: AbortSignal.timeout(3000)
+    });
+    if (bmResp.ok) {
+      const stats = await bmResp.json() as any;
+      bmHealthy = true;
+      bmPool = stats.poolSize || 0;
+    }
+  } catch {}
+
+  const status = bmHealthy ? 'healthy' : 'degraded';
+  res.status(bmHealthy ? 200 : 503).json({
+    status,
+    browser_pool: bmHealthy ? bmPool : 0,
     instance_id: process.env.INSTANCE_ID || 'main',
     auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
     uptime: (Date.now() - startTime) / 1000,
@@ -2696,7 +2731,11 @@ async function startServer(): Promise<void> {
 
   // Cleanup expired auth sessions periodically
   setInterval(async () => {
-    await authSessionManager?.cleanupExpired();
+    try {
+      await authSessionManager?.cleanupExpired();
+    } catch (e: any) {
+      console.error('Auth session cleanup failed:', e.message);
+    }
   }, 60000); // Every minute
 
   // T1: Heartbeat every 5 minutes
