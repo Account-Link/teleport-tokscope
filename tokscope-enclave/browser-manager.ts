@@ -49,8 +49,12 @@ class BrowserManager {
   private isInitialized = false;
   private isMaintenanceRunning = false; // NEW: Lock flag for pool maintenance
 
-  initialize(): void {
+  async initialize(): Promise<void> {
     this.isInitialized = true;
+
+    // Fix Docker CPUAffinity if pinned to 1 CPU (dstack 0.5.6+ TDX issue)
+    // See: https://github.com/Dstack-TEE/dstack/issues/410
+    await this.ensureDockerCpuAccess();
 
     console.log('🎭 Browser Manager initialized');
     console.log(`📊 Config: ${Math.round((this.config.tcb?.container_idle_timeout_ms || 600000) / 60000)} min idle timeout`);
@@ -59,6 +63,41 @@ class BrowserManager {
     this.startCleanupInterval();
     this.startPoolMaintenance();
     this.cleanupAllOrphanedContainers(); // Clean up ALL containers from previous instance (running + exited)
+  }
+
+  /**
+   * dstack 0.5.6+ pins Docker to CPU 0 via systemd CPUAffinity for faster
+   * image pulls on TDX. This makes Docker think it has 1 CPU, causing
+   * --cpus >1 to fail. If detected, clear the affinity via nsenter and
+   * restart Docker. The compose systemd service restarts us automatically.
+   * On second boot, Docker sees all CPUs and we proceed normally.
+   */
+  private async ensureDockerCpuAccess(): Promise<void> {
+    try {
+      const { stdout } = await execAsync('docker info --format "{{.NCPU}}"');
+      const ncpu = parseInt(stdout.trim());
+      if (ncpu > 1) {
+        console.log(`✅ Docker sees ${ncpu} CPUs — no CPUAffinity fix needed`);
+        return;
+      }
+
+      log.warn('BROWSER', 'cpu_affinity_pinned', { ncpu });
+      console.log('🔧 Docker pinned to 1 CPU — clearing CPUAffinity via nsenter...');
+      console.log('   Docker will restart and compose will bring us back.');
+
+      await execAsync(
+        'nsenter -t 1 -m -u -i -n -- sh -c "' +
+        'mkdir -p /etc/systemd/system/docker.service.d/ && ' +
+        'printf \'[Service]\\nCPUAffinity=\\n\' > /etc/systemd/system/docker.service.d/override.conf && ' +
+        'systemctl daemon-reload && ' +
+        'systemctl restart docker"'
+      );
+      // We won't reach here — Docker restart kills this container.
+      // Compose systemd service restarts us with Docker seeing all CPUs.
+    } catch (err: any) {
+      // Don't crash if fix fails — pool creation will handle reduced CPUs
+      console.error('⚠️ CPUAffinity fix failed (non-fatal):', err.message);
+    }
   }
 
   private generateContainerId(): string {
@@ -140,20 +179,26 @@ class BrowserManager {
         '--restart', 'no'
       ];
 
-      // Resource limits (configurable via env vars)
-      // CPU: for non-Phala / self-hosted environments we allow BROWSER_CPU_LIMIT
-      // to cap the number of CPUs via Docker's --cpus flag. On environments where
-      // CPU tuning is not supported (e.g. Phala Docker-in-Docker), simply omit
-      // BROWSER_CPU_LIMIT and no CPU limits will be applied.
-      const isPhala = !!process.env.PHALA_ENV;
-      const cpuLimitStr = !isPhala ? process.env.BROWSER_CPU_LIMIT : undefined;
-      if (!isPhala && cpuLimitStr) {
-        const limit = parseFloat(cpuLimitStr);
-        if (Number.isFinite(limit) && limit > 0) {
-          dockerCmd.push('--cpus', limit.toString());
-          console.log(`📊 Applying CPU limit for ${containerId}: --cpus=${limit}`);
-        } else {
-          console.log(`⚠️ Invalid BROWSER_CPU_LIMIT='${cpuLimitStr}', skipping CPU limit`);
+      // Resource limits: cap --cpus at what Docker actually sees.
+      // On TDX CVMs without the CPUAffinity fix, Docker may only see 1 CPU
+      // even though the host has 16. Rather than fail with "Range of CPUs is
+      // from 0.01 to 1.00", detect available CPUs and cap accordingly.
+      const cpuLimitStr = process.env.BROWSER_CPU_LIMIT;
+      if (cpuLimitStr) {
+        const requestedCpus = parseFloat(cpuLimitStr);
+        if (Number.isFinite(requestedCpus) && requestedCpus > 0) {
+          let availableCpus = requestedCpus;
+          try {
+            const { stdout } = await execAsync('docker info --format "{{.NCPU}}"');
+            availableCpus = parseInt(stdout.trim()) || requestedCpus;
+          } catch {}
+          const effectiveCpus = Math.min(requestedCpus, Math.max(availableCpus - 0.1, 0.5));
+          dockerCmd.push('--cpus', effectiveCpus.toString());
+          if (effectiveCpus < requestedCpus) {
+            log.warn('BROWSER', 'cpu_limit_capped', { requested: requestedCpus, available: availableCpus, effective: effectiveCpus });
+          } else {
+            console.log(`📊 Applying CPU limit for ${containerId}: --cpus=${effectiveCpus}`);
+          }
         }
       }
 
@@ -655,7 +700,7 @@ async function main() {
   app.use(express.json());
 
   const browserManager = new BrowserManager();
-  browserManager.initialize();
+  await browserManager.initialize();
 
   // Assign a browser container to a session
   app.post('/assign/:sessionId', async (req, res) => {
