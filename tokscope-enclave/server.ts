@@ -1470,9 +1470,6 @@ app.get('/auth/portal/:sessionToken', async (req, res) => {
 // Playwright-based sampling endpoints
 app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
   try {
-    if (process.env.AUTH_ONLY_MODE === 'true') {
-      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
-    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1521,9 +1518,6 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
 
 app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
   try {
-    if (process.env.AUTH_ONLY_MODE === 'true') {
-      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
-    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1569,9 +1563,6 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
 // Module-based sampling endpoints (placeholder - not primary focus)
 app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
   try {
-    if (process.env.AUTH_ONLY_MODE === 'true') {
-      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
-    }
     const { sessionId } = req.params;
     const { count = 10, module_type = 'web' } = req.body;
 
@@ -1626,9 +1617,6 @@ app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
 
 app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
   try {
-    if (process.env.AUTH_ONLY_MODE === 'true') {
-      return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
-    }
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
 
@@ -1674,9 +1662,6 @@ app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
 
 // Deprecated: Use /playwright/foryoupage/sample instead
 app.post('/scrape/:sessionId', async (req, res) => {
-  if (process.env.AUTH_ONLY_MODE === 'true') {
-    return res.status(503).json({ error: 'Instance is auth-only', message: 'Data operations should be routed to the Main TEE.' });
-  }
   console.log('⚠️  /scrape endpoint is deprecated, use /playwright/foryoupage/sample instead');
   res.status(410).json({
     error: 'Endpoint deprecated',
@@ -1768,22 +1753,6 @@ app.get('/containers', async (req, res) => {
 app.post('/api/tiktok/execute', async (req, res) => {
   try {
     const { sec_user_id, wireguard_bucket, ipfoxy_session, request } = req.body;
-
-    // AUTH_ONLY_MODE: Reject data operations on auth-only instances
-    if (process.env.AUTH_ONLY_MODE === 'true') {
-      const operation = req.body.request?.operation;
-      const authOperations = ['qr_auth', 'qr_auth_check', 'qr_auth_confirm'];
-
-      if (!authOperations.includes(operation)) {
-        console.log(`🚫 Rejecting ${operation} - instance is auth-only`);
-        return res.status(503).json({
-          error: 'Instance is auth-only',
-          message: 'This instance only handles authentication operations. Data operations (timeline, watch_history, like) should be routed to the Main TEE.',
-          operation,
-          instance_id: process.env.INSTANCE_ID || 'unknown'
-        });
-      }
-    }
 
     // 1. Verify Xordi API key
     const apiKey = req.header('X-Api-Key');
@@ -2643,7 +2612,6 @@ app.get('/health', async (req, res) => {
     status,
     browser_pool: bmHealthy ? bmPool : 0,
     instance_id: process.env.INSTANCE_ID || 'main',
-    auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
     uptime: (Date.now() - startTime) / 1000,
     sessions: sessionManager?.getSessionCount() || 0,
     dstack: !!dstackSDK,
@@ -2667,8 +2635,7 @@ app.get('/ready', async (req, res) => {
       res.json({
         status: 'ready',
         instance_id: process.env.INSTANCE_ID || 'main',
-        auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
-        capacity: {
+            capacity: {
           containers_available: available,
           containers_total: total,
           auth_slots_available: authSlotsAvailable
@@ -2701,8 +2668,7 @@ app.get('/tee-info', async (req, res) => {
     res.json({
       app_id: info.app_id,
       instance_id: info.instance_id,
-      auth_only_mode: process.env.AUTH_ONLY_MODE === 'true',
-      compose_hash: info.compose_hash,
+        compose_hash: info.compose_hash,
       tcb_info: info.tcb_info,
       dstack_sdk_version: (() => { try { return require('./package.json').dependencies['@phala/dstack-sdk']; } catch { return 'unknown'; } })()
     });
