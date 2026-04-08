@@ -2120,6 +2120,140 @@ app.post('/api/enclave/decrypt-watch-history', async (req, res) => {
 });
 
 /**
+ * Decrypt all watch history for a user (v2 — TEE-pull architecture)
+ * Instead of borgcube pushing encrypted blobs in the request body,
+ * the TEE pulls them from borgcube using the manifest + page endpoints.
+ * This avoids body size limits and reduces borgcube→TEE round-trips to one.
+ */
+app.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
+  try {
+    // Auth
+    const apiKey = req.header('X-Api-Key');
+    const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+    if (!apiKey || !allowedKeys.includes(apiKey)) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    // Guard: watch history key must be DStack-derived
+    if (!teeCrypto.isWatchHistoryKeyReady()) {
+      return res.status(503).json({ error: 'Watch history decryption key not initialized (DStack required)' });
+    }
+
+    const { sec_user_id, audit_context } = req.body;
+    if (!sec_user_id) {
+      return res.status(400).json({ error: 'sec_user_id is required' });
+    }
+
+    const xordiApiUrl = process.env.XORDI_API_URL || process.env.BORGCUBE_API_URL;
+    const xordiApiKey = (process.env.XORDI_API_KEY || '').split(',')[0];
+    if (!xordiApiUrl) {
+      return res.status(500).json({ error: 'XORDI_API_URL not configured' });
+    }
+
+    // 1. Fetch manifest from borgcube
+    const manifestResp = await axios.get(
+      `${xordiApiUrl}/api/enclave/get-encrypted-watch-history-manifest/${sec_user_id}`,
+      { headers: { 'X-Api-Key': xordiApiKey }, timeout: 10000 }
+    );
+
+    if (!manifestResp.data?.pages?.length) {
+      return res.json({ success: true, videos: [], total_count: 0, pages_decrypted: 0, pages_failed: 0 });
+    }
+
+    const pages = manifestResp.data.pages;
+    log.ok('TEE', 'watch_history_v2_manifest', { sec_user_id, total_pages: pages.length });
+
+    // 2. Fetch and decrypt pages in parallel batches of 10
+    const BATCH_SIZE = 10;
+    const allVideos: any[] = [];
+    const seenIds = new Set<string>();
+    let pagesFailed = 0;
+    let totalRawVideos = 0;
+
+    for (let i = 0; i < pages.length; i += BATCH_SIZE) {
+      const batch = pages.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(
+        batch.map((page: any) =>
+          axios.get(
+            `${xordiApiUrl}/api/enclave/get-encrypted-watch-history-page/${sec_user_id}/${page.id}`,
+            { headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
+          )
+        )
+      );
+
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          pagesFailed++;
+          log.warn('TEE', 'watch_history_v2_page_fetch_failed', { error: (result as any).reason?.message });
+          continue;
+        }
+
+        const encryptedHex = result.value.data?.encrypted_hex;
+        if (!encryptedHex) {
+          pagesFailed++;
+          continue;
+        }
+
+        try {
+          const decrypted = teeCrypto.decryptWatchHistory(encryptedHex);
+          const videos = decrypted?.aweme_list || decrypted?.videos || [];
+          if (Array.isArray(videos)) {
+            totalRawVideos += videos.length;
+            for (const video of videos) {
+              const id = video.aweme_id || video.video_id || video.id;
+              if (id && !seenIds.has(String(id))) {
+                seenIds.add(String(id));
+                allVideos.push(video);
+              }
+            }
+          }
+        } catch (decryptErr: any) {
+          pagesFailed++;
+          log.error('TEE', 'watch_history_v2_decrypt_fail', { error: decryptErr.message });
+        }
+      }
+    }
+
+    // 3. Audit log
+    log.ok('TEE', 'watch_history_v2_complete', {
+      sec_user_id,
+      pages_decrypted: pages.length - pagesFailed,
+      pages_failed: pagesFailed,
+      total_videos: allVideos.length,
+      deduplicated_from: totalRawVideos,
+    });
+
+    // Fire-and-forget audit write-back
+    if (xordiApiUrl && audit_context) {
+      axios.post(`${xordiApiUrl}/api/internal/write-audit-log`, {
+        operation: 'decrypt_watch_history_v2',
+        sec_user_id: audit_context.sec_user_id || sec_user_id,
+        app_name: audit_context.app_name,
+        request_id: audit_context.request_id,
+        event_timestamp: new Date().toISOString(),
+      }, {
+        headers: { 'X-Api-Key': xordiApiKey },
+        timeout: 5000,
+      }).catch((err: any) => {
+        log.warn('TEE', 'audit_writeback_failed', { error: err.message });
+      });
+    }
+
+    return res.json({
+      success: true,
+      videos: allVideos,
+      total_count: allVideos.length,
+      pages_decrypted: pages.length - pagesFailed,
+      pages_failed: pagesFailed,
+    });
+
+  } catch (error: any) {
+    log.error('TEE', 'watch_history_v2_endpoint_fail', { error: error.message });
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Encrypt watch history data (for plaintext → encrypted migration)
  * Called by borgcube migration script to encrypt existing plaintext watch history.
  * Sunset after Phase 4a completes (all plaintext deleted).
