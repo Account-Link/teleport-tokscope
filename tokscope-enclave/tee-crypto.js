@@ -41,6 +41,103 @@ class TEECrypto {
   }
 
   /**
+   * Set DStack-derived key for watch history encryption
+   * SEPARATE key from cookie encryption — different derivation path
+   */
+  setDStackWatchHistoryKey(derivedKeyBuffer) {
+    this._watchHistoryKey = derivedKeyBuffer;
+    log.ok('TEE', 'watch_history_key_derived', { method: 'dstack' });
+  }
+
+  /**
+   * Check if watch history DStack key is ready
+   * No fallback — returns false if DStack unavailable
+   */
+  isWatchHistoryKeyReady() {
+    return !!this._watchHistoryKey;
+  }
+
+  /**
+   * Encrypt watch history data (AES-256-GCM, NO fallback key)
+   * @param {any} data - Data to encrypt (will be JSON.stringify'd)
+   * @returns {string} Hex-encoded encrypted data
+   */
+  encryptWatchHistory(data) {
+    if (!this._watchHistoryKey) {
+      throw new Error('Watch history encryption key not initialized (DStack required)');
+    }
+    try {
+      const plaintext = JSON.stringify(data);
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', this._watchHistoryKey, iv);
+      let encrypted = cipher.update(plaintext, 'utf8');
+      encrypted = Buffer.concat([encrypted, cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      const combined = Buffer.concat([iv, authTag, encrypted]);
+      log.ok('TEE', 'watch_history_encrypt_ok', { bytes: combined.length });
+      return combined.toString('hex');
+    } catch (error) {
+      log.error('TEE', 'watch_history_encrypt_fail', { error: error.message });
+      throw new Error('Watch history encryption failed');
+    }
+  }
+
+  /**
+   * Decrypt watch history data (AES-256-GCM, NO fallback key)
+   * @param {string} encryptedHex - Hex-encoded encrypted data
+   * @returns {any} Decrypted data
+   */
+  decryptWatchHistory(encryptedHex) {
+    if (!this._watchHistoryKey) {
+      throw new Error('Watch history decryption key not initialized (DStack required)');
+    }
+    try {
+      const combined = Buffer.from(encryptedHex, 'hex');
+      const iv = combined.slice(0, 12);
+      const authTag = combined.slice(12, 28);
+      const encrypted = combined.slice(28);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', this._watchHistoryKey, iv);
+      decipher.setAuthTag(authTag);
+      let decrypted = decipher.update(encrypted);
+      decrypted = Buffer.concat([decrypted, decipher.final()]);
+      log.ok('TEE', 'watch_history_decrypt_ok', { bytes: combined.length });
+      return JSON.parse(decrypted.toString('utf8'));
+    } catch (error) {
+      log.error('TEE', 'watch_history_decrypt_fail', { error: error.message });
+      throw new Error('Watch history decryption failed');
+    }
+  }
+
+  /**
+   * Test watch history encryption/decryption roundtrip
+   */
+  testWatchHistory() {
+    if (!this._watchHistoryKey) {
+      console.log('⚠️ Watch history key not initialized, skipping test');
+      return false;
+    }
+    const testData = {
+      aweme_list: [
+        { aweme_id: '123', desc: 'test video', statistics: { play_count: 1000 } }
+      ],
+      has_more: 1,
+      cursor: '1698234567000'
+    };
+
+    console.log('🧪 Testing watch history crypto...');
+    const encrypted = this.encryptWatchHistory(testData);
+    console.log(`  Encrypted (${encrypted.length} chars): ${encrypted.substring(0, 32)}...`);
+
+    const decrypted = this.decryptWatchHistory(encrypted);
+    console.log(`  Decrypted:`, decrypted);
+
+    const match = JSON.stringify(testData) === JSON.stringify(decrypted);
+    console.log(`  Roundtrip test: ${match ? '✅ PASS' : '❌ FAIL'}`);
+
+    return match;
+  }
+
+  /**
    * Encrypt cookies with current key (AES-256-GCM)
    * @param {any} cookiesData - Cookies array or string
    * @returns {string} Hex-encoded encrypted data

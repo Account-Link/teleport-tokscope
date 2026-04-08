@@ -554,10 +554,15 @@ async function initDStack(): Promise<void> {
     const cookieKey = Buffer.from(cookieKeyResult.key).slice(0, 32);
     teeCrypto.setDStackKey(cookieKey);
 
+    // Watch history encryption key (SEPARATE derivation path — never shares key with cookies)
+    const watchHistoryKeyResult = await client.getKey('watch-history-encryption', 'aes');
+    const watchHistoryKey = Buffer.from(watchHistoryKeyResult.key).slice(0, 32);
+    teeCrypto.setDStackWatchHistoryKey(watchHistoryKey);
+
     // Keep reference for /health endpoint
     dstackSDK = client;
 
-    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies');
+    console.log('✅ DStack initialized, using TEE-derived keys for sessions + cookies + watch-history');
   } catch (error: any) {
     console.log('⚠️ DStack unavailable, using fallback encryption keys:', error.message);
     const seed = 'tcb-session-encryption-fallback-seed-12345';
@@ -2019,12 +2024,136 @@ app.post('/api/tiktok/execute', async (req, res) => {
 
     const tiktokResponse = await axios.request(axiosConfig);
 
-    // 8. Return response (public video metadata)
+    // 8. Return response — optionally encrypt if requested (v1.1.8)
+    if (req.body.encrypt_response && teeCrypto.isWatchHistoryKeyReady()) {
+      const responseData = tiktokResponse.data;
+      // Extract pagination metadata BEFORE encrypting (borgcube needs these for scrape loop)
+      const hasMore = !!(responseData.has_more ?? responseData.hasMore);
+      const cursor = responseData.cursor || responseData.max_cursor || null;
+      // Encrypt the full response (video data + everything)
+      const encryptedHex = teeCrypto.encryptWatchHistory(responseData);
+      return res.json({
+        encrypted: encryptedHex,
+        has_more: hasMore,
+        cursor: cursor,
+      });
+    } else if (req.body.encrypt_response && !teeCrypto.isWatchHistoryKeyReady()) {
+      // encrypt_response requested but DStack key not available
+      // In production (DStack socket exists but key failed): hard-fail 503
+      // In dev/staging (no DStack at all): fall through to plaintext
+      const dstackSocketExists = fs.existsSync('/var/run/dstack.sock');
+      if (dstackSocketExists) {
+        return res.status(503).json({ error: 'Watch history encryption key not initialized' });
+      }
+      log.warn('TEE', 'encrypt_response_no_dstack', { reason: 'returning_plaintext' });
+    }
+    // Default: return plaintext (normal path, or dev fallback when no DStack)
     res.json(tiktokResponse.data);
 
   } catch (error: any) {
     console.error('TikTok request execution failed:', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+// WATCH HISTORY ENCRYPTION/DECRYPTION (v1.1.8)
+// ============================================================================
+
+/**
+ * Decrypt TEE-encrypted watch history data
+ * Called by borgcube when a 3P app requests watch history for an authorized user.
+ * borgcube pre-authorizes the 3P app before proxying here.
+ */
+app.post('/api/enclave/decrypt-watch-history', async (req, res) => {
+  try {
+    // Auth: same XORDI_API_KEY as /api/tiktok/execute
+    const apiKey = req.header('X-Api-Key');
+    const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+    if (!apiKey || !allowedKeys.includes(apiKey)) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    // Guard: watch history key must be DStack-derived (no fallback)
+    if (!teeCrypto.isWatchHistoryKeyReady()) {
+      return res.status(503).json({ error: 'Watch history decryption key not initialized (DStack required)' });
+    }
+
+    const { encrypted_data, audit_context } = req.body;
+    if (!encrypted_data || typeof encrypted_data !== 'string') {
+      return res.status(400).json({ error: 'encrypted_data (hex string) is required' });
+    }
+
+    // Decrypt
+    const decrypted = teeCrypto.decryptWatchHistory(encrypted_data);
+
+    // Audit log (local)
+    log.ok('TEE', 'watch_history_decrypted', {
+      sec_user_id: audit_context?.sec_user_id,
+      app_name: audit_context?.app_name,
+      request_id: audit_context?.request_id,
+    });
+
+    // Fire-and-forget audit write-back to borgcube (if configured)
+    const xordiApiUrl = process.env.XORDI_API_URL || process.env.BORGCUBE_API_URL;
+    if (xordiApiUrl && audit_context) {
+      axios.post(`${xordiApiUrl}/api/internal/write-audit-log`, {
+        operation: 'decrypt_watch_history',
+        sec_user_id: audit_context.sec_user_id,
+        app_name: audit_context.app_name,
+        request_id: audit_context.request_id,
+        event_timestamp: new Date().toISOString(),
+      }, {
+        headers: { 'X-Api-Key': (process.env.XORDI_API_KEY || '').split(',')[0] || '' },
+        timeout: 5000,
+      }).catch((err: any) => {
+        log.warn('TEE', 'audit_writeback_failed', { error: err.message });
+      });
+    }
+
+    return res.json({ data: decrypted });
+
+  } catch (error: any) {
+    log.error('TEE', 'watch_history_decrypt_endpoint_fail', { error: error.message });
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Encrypt watch history data (for plaintext → encrypted migration)
+ * Called by borgcube migration script to encrypt existing plaintext watch history.
+ * Sunset after Phase 4a completes (all plaintext deleted).
+ */
+app.post('/api/enclave/encrypt-watch-history', async (req, res) => {
+  try {
+    // Auth
+    const apiKey = req.header('X-Api-Key');
+    const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
+    if (!apiKey || !allowedKeys.includes(apiKey)) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    // Guard: watch history key must be DStack-derived (no fallback)
+    if (!teeCrypto.isWatchHistoryKeyReady()) {
+      return res.status(503).json({ error: 'Watch history encryption key not initialized (DStack required)' });
+    }
+
+    const { data } = req.body;
+    if (!data) {
+      return res.status(400).json({ error: 'data field is required' });
+    }
+
+    const encryptedHex = teeCrypto.encryptWatchHistory(data);
+
+    log.ok('TEE', 'watch_history_encrypted_for_migration', {
+      data_size: JSON.stringify(data).length,
+    });
+
+    return res.json({ success: true, encrypted: encryptedHex });
+
+  } catch (error: any) {
+    log.error('TEE', 'watch_history_encrypt_endpoint_fail', { error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -2618,6 +2747,7 @@ app.get('/health', async (req, res) => {
     dstackInitialized: !!dstackSDK,
     encryption: !!encryptionKey,
     cookieEncryption: teeCrypto.isDStackKey() ? 'dstack' : 'fallback',
+    watchHistoryEncryption: teeCrypto.isWatchHistoryKeyReady() ? 'dstack' : 'unavailable',
     timestamp: new Date().toISOString()
   });
 });
