@@ -447,7 +447,7 @@ class SessionManager {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '500kb' }));
 
 let browser: Browser | null = null;
 let page: Page | null = null;
