@@ -797,7 +797,10 @@ app.post('/auth/start/:sessionId', async (req, res) => {
           return; // Portal flow complete — do not fall through to QR flow
         }
 
-        // v1.1.3F2: Navigate from pre-loaded tiktok.com → /login/qrcode (same-origin, fast)
+        // v1.1.11: pre-nav disabled in browser-manager. This goto is the FIRST
+        // and ONLY CDP-driven navigation per container lifetime — avoids the
+        // sequential-CDP handoff issue that caused page.goto timeouts.
+        // Cold DNS/TLS cost absorbed here (~1-3s) rather than hidden in pre-nav.
         //
         // v1.1.10 diagnostic: instrument the page to capture WHICH network requests
         // hang when page.goto times out. page.goto with waitUntil='domcontentloaded'

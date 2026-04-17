@@ -282,8 +282,22 @@ class BrowserManager {
       await this.configureContainerProxy(containerInfo);
       console.log(`✅ Container ${containerId.substring(0, 16)}... proxy pre-configured`);
 
-      // v1.1.3F2: Pre-navigate to TikTok to cache assets for fast QR auth
-      await this.preNavigateToTikTok(containerInfo);
+      // v1.1.11: Pre-navigation DISABLED.
+      //
+      // Why: pre-nav opens a raw WebSocket CDP connection, sends Page.navigate,
+      // closes. Later at assign time, Playwright opens a SECOND CDP connection
+      // to the same Chrome. On prod1 we observed sequential CDP handoffs
+      // failing ECONNREFUSED / 30s timeouts, causing 100% QR auth failure
+      // after v1.1.8B. Chromium has known issues with sequential CDP clients
+      // on the same target (stale session state, TIME_WAIT, etc.).
+      //
+      // Cost: first navigation per container is ~1-3s slower (cold DNS + TLS
+      // to tiktok.com). Trade vs. 30s+ page.goto timeouts that were happening.
+      //
+      // The preNavigateToTikTok() method is retained (dead code) to preserve
+      // easy-revert path if this change turns out wrong; remove in a later
+      // cleanup release.
+      // await this.preNavigateToTikTok(containerInfo);
 
       this.containers.set(containerId, containerInfo);
       this.containerPool.push(containerId);
