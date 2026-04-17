@@ -135,6 +135,36 @@ class TEECrypto {
   }
 
   /**
+   * v1.2.0: batch decrypt + dedup across multiple pages, all in one worker call.
+   *
+   * Hot path optimization for /api/enclave/decrypt-watch-history-v2. Replaces
+   * a per-page loop that structured-cloned a 1 MB parsed object back to main
+   * thread on every iteration. Now main thread only pays one clone for the
+   * compact dedup result.
+   *
+   * @param {string[]} encryptedHexes - iv|authTag|ciphertext hex strings
+   * @param {string[]} seenIds - existing video IDs to dedup against
+   * @returns {Promise<{newVideos: any[], newlyAddedIds: string[], totalRawVideos: number, pagesFailed: number}>}
+   */
+  async decryptAndDedupWatchHistory(encryptedHexes, seenIds = []) {
+    if (!this._watchHistoryKey) {
+      throw new Error('Watch history decryption key not initialized (DStack required)');
+    }
+    try {
+      const result = await cryptoPool.decryptAndDedup(encryptedHexes, seenIds);
+      log.ok('TEE', 'watch_history_batch_decrypt_ok', {
+        pages: encryptedHexes.length,
+        new_videos: result.newVideos.length,
+        pages_failed: result.pagesFailed,
+      });
+      return result;
+    } catch (error) {
+      log.error('TEE', 'watch_history_batch_decrypt_fail', { error: error.message });
+      throw new Error('Watch history batch decrypt failed');
+    }
+  }
+
+  /**
    * Test watch history encryption/decryption roundtrip (async since v1.1.9).
    */
   async testWatchHistory() {

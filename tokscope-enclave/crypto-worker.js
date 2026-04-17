@@ -66,6 +66,47 @@ function doDecrypt(hex) {
   return JSON.parse(decrypted.toString('utf8'));
 }
 
+/**
+ * v1.2.0: Decrypt a batch of hex-encoded pages, dedup videos across pages
+ * against an initial seenIds set. All work (AES + JSON.parse + dedup loop)
+ * happens in this worker thread — main thread receives only a compact
+ * result instead of one ~1 MB parsed object per page.
+ *
+ * Per-page failures are caught and counted (does NOT fail the whole batch)
+ * — matches the existing per-page semantics in server.ts:2289.
+ *
+ * @param {string[]} hexes - list of iv|authTag|ciphertext hex strings
+ * @param {string[]} seenIdsIn - existing video IDs from prior batches
+ * @returns {{newVideos: any[], newlyAddedIds: string[], totalRawVideos: number, pagesFailed: number}}
+ */
+function doDecryptAndDedup(hexes, seenIdsIn) {
+  const seen = new Set(seenIdsIn || []);
+  const newVideos = [];
+  const newlyAddedIds = [];
+  let totalRawVideos = 0;
+  let pagesFailed = 0;
+  for (const hex of hexes) {
+    try {
+      const decrypted = doDecrypt(hex);
+      const videos = decrypted?.aweme_list || decrypted?.videos || [];
+      if (Array.isArray(videos)) {
+        totalRawVideos += videos.length;
+        for (const v of videos) {
+          const id = String(v.aweme_id || v.video_id || v.id || '');
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            newlyAddedIds.push(id);
+            newVideos.push(v);
+          }
+        }
+      }
+    } catch (e) {
+      pagesFailed++;
+    }
+  }
+  return { newVideos, newlyAddedIds, totalRawVideos, pagesFailed };
+}
+
 parentPort.on('message', (msg) => {
   const { id, op } = msg || {};
   try {
@@ -93,6 +134,13 @@ parentPort.on('message', (msg) => {
     if (op === 'decrypt') {
       // Return parsed JSON directly via structured-clone; main must NOT re-parse.
       respond(id, { ok: true, result: doDecrypt(msg.hex) });
+      return;
+    }
+
+    if (op === 'decryptAndDedup') {
+      // v1.2.0: batch decrypt + dedup in worker thread. Keeps main-thread
+      // structured-clone cost at O(newVideos) instead of O(hexes * 1MB).
+      respond(id, { ok: true, result: doDecryptAndDedup(msg.hexes, msg.seenIds) });
       return;
     }
 

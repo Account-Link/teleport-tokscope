@@ -2259,36 +2259,38 @@ app.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
         )
       );
 
+      // v1.2.0: collect successfully-fetched hexes, then do one batch
+      // decrypt-and-dedup call so main thread pays O(1) structured-clone
+      // cost instead of O(n pages). Fetch failures are still counted here
+      // per-page to preserve the existing log.warn semantics.
+      const hexesToDecrypt: string[] = [];
       for (const result of results) {
         if (result.status === 'rejected') {
           pagesFailed++;
           log.warn('TEE', 'watch_history_v2_page_fetch_failed', { error: (result as any).reason?.message });
           continue;
         }
-
         const encryptedHex = result.value.data?.encrypted_hex;
         if (!encryptedHex) {
           pagesFailed++;
           continue;
         }
+        hexesToDecrypt.push(encryptedHex);
+      }
 
+      if (hexesToDecrypt.length > 0) {
         try {
-          // v1.1.9: async — worker_threads pool
-          const decrypted = await teeCrypto.decryptWatchHistory(encryptedHex);
-          const videos = decrypted?.aweme_list || decrypted?.videos || [];
-          if (Array.isArray(videos)) {
-            totalRawVideos += videos.length;
-            for (const video of videos) {
-              const id = video.aweme_id || video.video_id || video.id;
-              if (id && !seenIds.has(String(id))) {
-                seenIds.add(String(id));
-                allVideos.push(video);
-              }
-            }
-          }
-        } catch (decryptErr: any) {
-          pagesFailed++;
-          log.error('TEE', 'watch_history_v2_decrypt_fail', { error: decryptErr.message });
+          const batchResult = await teeCrypto.decryptAndDedupWatchHistory(
+            hexesToDecrypt,
+            Array.from(seenIds)
+          );
+          totalRawVideos += batchResult.totalRawVideos;
+          pagesFailed += batchResult.pagesFailed;
+          for (const id of batchResult.newlyAddedIds) seenIds.add(id);
+          for (const v of batchResult.newVideos) allVideos.push(v);
+        } catch (batchErr: any) {
+          pagesFailed += hexesToDecrypt.length;
+          log.error('TEE', 'watch_history_v2_batch_decrypt_fail', { error: batchErr.message });
         }
       }
     }

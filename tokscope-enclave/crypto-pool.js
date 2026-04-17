@@ -95,6 +95,21 @@ class CryptoPool {
     return this._sendTo(entry, { op: 'decrypt', hex });
   }
 
+  /**
+   * v1.2.0: decrypt a batch of hex pages and dedup videos in the worker.
+   * Main thread pays structured-clone cost ONCE for the compact result
+   * instead of once per page for a 1 MB parsed object.
+   *
+   * @param {string[]} hexes
+   * @param {string[]} seenIds
+   * @returns {Promise<{newVideos: any[], newlyAddedIds: string[], totalRawVideos: number, pagesFailed: number}>}
+   */
+  async decryptAndDedup(hexes, seenIds) {
+    await this.waitUntilReady();
+    const entry = this._pickWorker();
+    return this._sendTo(entry, { op: 'decryptAndDedup', hexes, seenIds });
+  }
+
   async shutdown() {
     this.shuttingDown = true;
     const terminates = this.workers
