@@ -98,6 +98,9 @@ RUN mkdir -p /npm-cache && \
 COPY tokscope-enclave/security-service/ ./security-service/
 COPY tokscope-enclave/xordi-security-module.js ./xordi-security-module.js
 COPY tokscope-enclave/tee-crypto.js ./tee-crypto.js
+# v1.1.9: worker_threads pool for watch-history crypto (see crypto-pool.js / crypto-worker.js)
+COPY tokscope-enclave/crypto-pool.js ./crypto-pool.js
+COPY tokscope-enclave/crypto-worker.js ./crypto-worker.js
 
 # Start API server
 CMD ["node", "server.js"]

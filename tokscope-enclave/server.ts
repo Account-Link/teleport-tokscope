@@ -559,6 +559,11 @@ async function initDStack(): Promise<void> {
     const watchHistoryKey = Buffer.from(watchHistoryKeyResult.key).slice(0, 32);
     teeCrypto.setDStackWatchHistoryKey(watchHistoryKey);
 
+    // v1.1.9: block until the crypto worker pool has acknowledged the key.
+    // This guarantees the HTTP server never answers a request before the
+    // pool is ready — no race between startup and first scrape.
+    await teeCrypto.waitForWorkersReady();
+
     // Keep reference for /health endpoint
     dstackSDK = client;
 
@@ -2030,8 +2035,9 @@ app.post('/api/tiktok/execute', async (req, res) => {
       // Extract pagination metadata BEFORE encrypting (borgcube needs these for scrape loop)
       const hasMore = !!(responseData.has_more ?? responseData.hasMore);
       const cursor = responseData.cursor || responseData.max_cursor || null;
-      // Encrypt the full response (video data + everything)
-      const encryptedHex = teeCrypto.encryptWatchHistory(responseData);
+      // Encrypt the full response (video data + everything).
+      // v1.1.9: async — delegated to worker_threads pool.
+      const encryptedHex = await teeCrypto.encryptWatchHistory(responseData);
       return res.json({
         encrypted: encryptedHex,
         has_more: hasMore,
@@ -2084,8 +2090,8 @@ app.post('/api/enclave/decrypt-watch-history', async (req, res) => {
       return res.status(400).json({ error: 'encrypted_data (hex string) is required' });
     }
 
-    // Decrypt
-    const decrypted = teeCrypto.decryptWatchHistory(encrypted_data);
+    // Decrypt (v1.1.9: async — worker_threads pool)
+    const decrypted = await teeCrypto.decryptWatchHistory(encrypted_data);
 
     // Audit log (local)
     log.ok('TEE', 'watch_history_decrypted', {
@@ -2195,7 +2201,8 @@ app.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
         }
 
         try {
-          const decrypted = teeCrypto.decryptWatchHistory(encryptedHex);
+          // v1.1.9: async — worker_threads pool
+          const decrypted = await teeCrypto.decryptWatchHistory(encryptedHex);
           const videos = decrypted?.aweme_list || decrypted?.videos || [];
           if (Array.isArray(videos)) {
             totalRawVideos += videos.length;
@@ -2277,7 +2284,8 @@ app.post('/api/enclave/encrypt-watch-history', async (req, res) => {
       return res.status(400).json({ error: 'data field is required' });
     }
 
-    const encryptedHex = teeCrypto.encryptWatchHistory(data);
+    // v1.1.9: async — worker_threads pool
+    const encryptedHex = await teeCrypto.encryptWatchHistory(data);
 
     log.ok('TEE', 'watch_history_encrypted_for_migration', {
       data_size: JSON.stringify(data).length,
@@ -2967,6 +2975,25 @@ async function startServer(): Promise<void> {
       console.error('Auth session cleanup failed:', e.message);
     }
   }, 60000); // Every minute
+
+  // v1.1.9: event-loop-lag monitor. Catches regressions of the v1.1.8 bug
+  // where synchronous crypto on the main thread starved auth orchestration.
+  // p99_ms > 50 over a 60s window is a red flag — investigate before it
+  // cascades into auth failures. Uses perf_hooks.monitorEventLoopDelay for
+  // an efficient kernel-level histogram (no setInterval polling overhead).
+  try {
+    const { monitorEventLoopDelay } = require('node:perf_hooks');
+    const elDelay = monitorEventLoopDelay({ resolution: 20 });
+    elDelay.enable();
+    setInterval(() => {
+      const p99 = Number((elDelay.percentile(99) / 1e6).toFixed(1));
+      const max = Number((elDelay.max / 1e6).toFixed(1));
+      log.ok('TEE', 'event_loop_lag', { p99_ms: p99, max_ms: max });
+      elDelay.reset();
+    }, 60_000).unref();
+  } catch (e: any) {
+    log.warn('TEE', 'event_loop_lag_init_failed', { err: e.message });
+  }
 
   // T1: Heartbeat every 5 minutes
   setInterval(() => {
