@@ -798,13 +798,82 @@ app.post('/auth/start/:sessionId', async (req, res) => {
         }
 
         // v1.1.3F2: Navigate from pre-loaded tiktok.com → /login/qrcode (same-origin, fast)
+        //
+        // v1.1.10 diagnostic: instrument the page to capture WHICH network requests
+        // hang when page.goto times out. page.goto with waitUntil='domcontentloaded'
+        // has been failing at 30s on prod1 with no visible cause. These listeners
+        // produce definitive logs showing: pending requests at timeout, failed
+        // requests with error text, console errors, and page JS exceptions.
         const navStart = Date.now();
-        console.log(`🌐 Navigating to QR login page for auth ${authSessionId.substring(0, 8)}... (from ${authPage.url()})`);
-        await authPage.goto('https://www.tiktok.com/login/qrcode', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
-        console.log(`⏱️ QR page loaded in ${Date.now() - navStart}ms for ${authSessionId.substring(0, 8)}...`);
+        const sessionPrefix = authSessionId.substring(0, 8);
+        console.log(`🌐 Navigating to QR login page for auth ${sessionPrefix}... (from ${authPage.url()})`);
+
+        const pendingRequests: Set<string> = new Set();
+        const failedRequests: Array<{ url: string; err: string }> = [];
+        const consoleErrors: string[] = [];
+        const pageErrors: string[] = [];
+
+        const onRequest = (req: any) => { pendingRequests.add(req.url()); };
+        const onRequestFinished = (req: any) => { pendingRequests.delete(req.url()); };
+        const onRequestFailed = (req: any) => {
+          pendingRequests.delete(req.url());
+          failedRequests.push({ url: req.url().substring(0, 150), err: req.failure()?.errorText || 'unknown' });
+        };
+        const onConsole = (msg: any) => {
+          if (msg.type() === 'error' || msg.type() === 'warning') {
+            consoleErrors.push(`[${msg.type()}] ${msg.text().substring(0, 200)}`);
+          }
+        };
+        const onPageError = (err: any) => { pageErrors.push(err.message?.substring(0, 200) || String(err)); };
+
+        authPage.on('request', onRequest);
+        authPage.on('requestfinished', onRequestFinished);
+        authPage.on('requestfailed', onRequestFailed);
+        authPage.on('console', onConsole);
+        authPage.on('pageerror', onPageError);
+
+        try {
+          await authPage.goto('https://www.tiktok.com/login/qrcode', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          console.log(`⏱️ QR page loaded in ${Date.now() - navStart}ms for ${sessionPrefix}...`);
+          log.ok('AUTH', 'goto_success', {
+            session: sessionPrefix,
+            duration_ms: Date.now() - navStart,
+            pending_at_finish: pendingRequests.size,
+            failed_count: failedRequests.length
+          });
+        } catch (navErr: any) {
+          // THE diagnostic output: dump what Chrome was actually doing when it timed out.
+          const pendingList = Array.from(pendingRequests).slice(0, 10).map((u) => u.substring(0, 150));
+          log.fail('AUTH', 'goto_timeout_diagnosis', {
+            session: sessionPrefix,
+            duration_ms: Date.now() - navStart,
+            current_url: authPage.url().substring(0, 150),
+            pending_count: pendingRequests.size,
+            failed_count: failedRequests.length,
+            console_errors: consoleErrors.length,
+            page_errors: pageErrors.length,
+            err: navErr.message?.substring(0, 200) || String(navErr)
+          });
+          // Log first 10 pending URLs individually so they survive log line length limits
+          for (const u of pendingList) {
+            log.fail('AUTH', 'goto_timeout_pending_url', { session: sessionPrefix, url: u });
+          }
+          for (const f of failedRequests.slice(0, 10)) {
+            log.fail('AUTH', 'goto_request_failed', { session: sessionPrefix, url: f.url, err: f.err });
+          }
+          for (const msg of consoleErrors.slice(0, 10)) {
+            log.fail('AUTH', 'goto_console_error', { session: sessionPrefix, msg: msg.substring(0, 180) });
+          }
+          for (const err of pageErrors.slice(0, 10)) {
+            log.fail('AUTH', 'goto_page_error', { session: sessionPrefix, err: err.substring(0, 180) });
+          }
+          // Do NOT rethrow — fall through to waitForSelector. If the page rendered
+          // enough for the QR <img> to appear, we can still succeed. If not, the
+          // existing qr_not_visible diagnostic path fires and captures the screenshot.
+        }
 
         // Wait for QR code with diagnostics on failure
         try {
