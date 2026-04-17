@@ -31,6 +31,39 @@ process.on('uncaughtException', (error: Error) => {
 
 const BROWSER_MANAGER_URL = process.env.BROWSER_MANAGER_URL || 'http://browser-manager:3001';
 
+// ---------------------------------------------------------------------------
+// v1.2.1 — Dual-process mode gate.
+//
+// The tokscope-enclave image runs in one of three modes, selected at startup
+// by the TOKSCOPE_MODE env var (set in docker-compose per service):
+//
+//   TOKSCOPE_MODE=auth   → this process serves ONLY authentication routes
+//                           (/auth/*, /upload-session, /containers, etc.)
+//                           No crypto worker pool, no migration routes.
+//                           Gives auth its own Node event loop so heavy
+//                           watch-history decrypts on the data process
+//                           physically cannot starve Playwright CDP connects.
+//
+//   TOKSCOPE_MODE=data   → this process serves ONLY data routes
+//                           (/api/tiktok/execute, /api/enclave/*, /migrate/*).
+//                           Owns the crypto worker pool. No browser-manager
+//                           calls. No auth session state.
+//
+//   TOKSCOPE_MODE=all    → single-process legacy mode (what we ran pre-v1.2.1).
+//                           Registers every route. Kept for local dev and as
+//                           a rollback safety valve — if the split misbehaves
+//                           in prod, setting one container to 'all' restores
+//                           pre-v1.2.1 behavior without a code revert.
+//
+// Both processes share the same CVM, same app_id, same DStack-derived keys —
+// key derivation is deterministic per (app_id, key_id), a DStack platform
+// guarantee. Encrypted rows written by one process are readable by the other.
+// ---------------------------------------------------------------------------
+const MODE = (process.env.TOKSCOPE_MODE || 'all').toLowerCase();  // 'auth' | 'data' | 'all'
+const isAuth = MODE === 'auth' || MODE === 'all';
+const isData = MODE === 'data' || MODE === 'all';
+console.log(`[TEE] Starting in TOKSCOPE_MODE=${MODE} (auth=${isAuth}, data=${isData})`);
+
 interface SessionData {
   user?: {
     sec_user_id?: string;
@@ -449,6 +482,31 @@ class SessionManager {
 const app = express();
 app.use(express.json({ limit: '500kb' }));
 
+// ---------------------------------------------------------------------------
+// v1.2.1 — Mode-gated route registrars.
+//
+// Each route below uses ONE of three registrars:
+//   appAuth.X(...)  → only registered when isAuth (MODE=auth or all)
+//   appData.X(...)  → only registered when isData (MODE=data or all)
+//   app.X(...)      → ALWAYS registered (shared: /health, /ready, /tee-info)
+//
+// In the "off" mode the methods no-op at registration time — an unregistered
+// route will 404 at request time, which is the correct behavior (data client
+// hitting an auth-only process, or vice versa, should fail loudly).
+//
+// When adding a new route: decide which process should own it and use the
+// matching registrar. If unsure, check the table in RELEASE-v1.2.1-PROD1.md.
+// ---------------------------------------------------------------------------
+const noopApp: any = {
+  get: () => noopApp,
+  post: () => noopApp,
+  delete: () => noopApp,
+  put: () => noopApp,
+  use: () => noopApp,
+};
+const appAuth: typeof app = (isAuth ? app : noopApp) as any;
+const appData: typeof app = (isData ? app : noopApp) as any;
+
 let browser: Browser | null = null;
 let page: Page | null = null;
 let dstackSDK: any = null;
@@ -606,7 +664,7 @@ function decryptSessionData(encryptedData: any): SessionData {
   return JSON.parse(decrypted);
 }
 
-app.post('/upload-session', (req, res) => {
+appAuth.post('/upload-session', (req, res) => {
   try {
     const { sessionData } = req.body;
 
@@ -635,7 +693,7 @@ app.post('/upload-session', (req, res) => {
   }
 });
 
-app.post('/load-session', (req, res) => {
+appAuth.post('/load-session', (req, res) => {
   try {
     const { encryptedSession, sessionData } = req.body;
 
@@ -667,7 +725,7 @@ app.post('/load-session', (req, res) => {
   }
 });
 
-app.get('/sessions', (req, res) => {
+appAuth.get('/sessions', (req, res) => {
   if (!sessionManager) {
     return res.status(500).json({ error: 'Session manager not initialized' });
   }
@@ -683,7 +741,7 @@ app.get('/sessions', (req, res) => {
 });
 
 // Authentication endpoints
-app.post('/auth/start/:sessionId', async (req, res) => {
+appAuth.post('/auth/start/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     // v1.1.3login: accept portalMode, portalTimeoutMs, portalLoginUrl in addition to preAuthToken
@@ -1436,7 +1494,7 @@ async function waitForPortalLoginCompletion(
 }
 
 
-app.get('/auth/poll/:authSessionId', (req, res) => {
+appAuth.get('/auth/poll/:authSessionId', (req, res) => {
   try {
     const { authSessionId } = req.params;
 
@@ -1484,7 +1542,7 @@ app.get('/auth/poll/:authSessionId', (req, res) => {
   }
 });
 
-app.post('/auth/destroy/:authSessionId', async (req, res) => {
+appAuth.post('/auth/destroy/:authSessionId', async (req, res) => {
   try {
     const { authSessionId } = req.params;
     if (!/^[a-f0-9\-]{36}$/.test(authSessionId)) {
@@ -1503,7 +1561,7 @@ app.post('/auth/destroy/:authSessionId', async (req, res) => {
  * Token is invalidated after first use (single-use enforcement).
  * VNC access is gated by TCP proxy lifecycle — no session = port 6080 not listening.
  */
-app.get('/auth/portal/:sessionToken', async (req, res) => {
+appAuth.get('/auth/portal/:sessionToken', async (req, res) => {
   try {
     const { sessionToken } = req.params;
 
@@ -1550,7 +1608,7 @@ app.get('/auth/portal/:sessionToken', async (req, res) => {
 });
 
 // Playwright-based sampling endpoints
-app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
+appAuth.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
@@ -1598,7 +1656,7 @@ app.post('/playwright/foryoupage/sample/:sessionId', async (req, res) => {
   }
 });
 
-app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
+appAuth.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
@@ -1643,7 +1701,7 @@ app.post('/playwright/watchhistory/sample/:sessionId', async (req, res) => {
 });
 
 // Module-based sampling endpoints (placeholder - not primary focus)
-app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
+appAuth.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { count = 10, module_type = 'web' } = req.body;
@@ -1697,7 +1755,7 @@ app.post('/modules/foryoupage/sample/:sessionId', async (req, res) => {
   }
 });
 
-app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
+appAuth.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { count = 10 } = req.body;
@@ -1743,7 +1801,7 @@ app.post('/modules/watchhistory/sample/:sessionId', async (req, res) => {
 });
 
 // Deprecated: Use /playwright/foryoupage/sample instead
-app.post('/scrape/:sessionId', async (req, res) => {
+appAuth.post('/scrape/:sessionId', async (req, res) => {
   console.log('⚠️  /scrape endpoint is deprecated, use /playwright/foryoupage/sample instead');
   res.status(410).json({
     error: 'Endpoint deprecated',
@@ -1752,7 +1810,7 @@ app.post('/scrape/:sessionId', async (req, res) => {
 });
 
 // Container management endpoints
-app.post('/containers/create', async (req, res) => {
+appAuth.post('/containers/create', async (req, res) => {
   try {
     const { proxy } = req.body;
 
@@ -1777,7 +1835,7 @@ app.post('/containers/create', async (req, res) => {
   }
 });
 
-app.delete('/containers/:containerId', async (req, res) => {
+appAuth.delete('/containers/:containerId', async (req, res) => {
   try {
     const { containerId } = req.params;
 
@@ -1796,7 +1854,7 @@ app.delete('/containers/:containerId', async (req, res) => {
   }
 });
 
-app.get('/containers', async (req, res) => {
+appAuth.get('/containers', async (req, res) => {
   try {
     const response = await fetch(`${BROWSER_MANAGER_URL}/stats`);
 
@@ -1832,7 +1890,7 @@ app.get('/containers', async (req, res) => {
  * - Executes signed request to TikTok
  * - Returns response (public video metadata)
  */
-app.post('/api/tiktok/execute', async (req, res) => {
+appData.post('/api/tiktok/execute', async (req, res) => {
   try {
     const { sec_user_id, wireguard_bucket, ipfoxy_session, request } = req.body;
 
@@ -2143,7 +2201,7 @@ app.post('/api/tiktok/execute', async (req, res) => {
  * Called by borgcube when a 3P app requests watch history for an authorized user.
  * borgcube pre-authorizes the 3P app before proxying here.
  */
-app.post('/api/enclave/decrypt-watch-history', async (req, res) => {
+appData.post('/api/enclave/decrypt-watch-history', async (req, res) => {
   try {
     // Auth: same XORDI_API_KEY as /api/tiktok/execute
     const apiKey = req.header('X-Api-Key');
@@ -2203,7 +2261,7 @@ app.post('/api/enclave/decrypt-watch-history', async (req, res) => {
  * the TEE pulls them from borgcube using the manifest + page endpoints.
  * This avoids body size limits and reduces borgcube→TEE round-trips to one.
  */
-app.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
+appData.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
   try {
     // Auth
     const apiKey = req.header('X-Api-Key');
@@ -2339,7 +2397,7 @@ app.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
  * Called by borgcube migration script to encrypt existing plaintext watch history.
  * Sunset after Phase 4a completes (all plaintext deleted).
  */
-app.post('/api/enclave/encrypt-watch-history', async (req, res) => {
+appData.post('/api/enclave/encrypt-watch-history', async (req, res) => {
   try {
     // Auth
     const apiKey = req.header('X-Api-Key');
@@ -2387,7 +2445,7 @@ app.post('/api/enclave/encrypt-watch-history', async (req, res) => {
  * POST /migrate/process-pending
  * Requires X-Migration-Key header matching MIGRATION_TRIGGER_KEY env var
  */
-app.post('/migrate/process-pending', async (req, res) => {
+appData.post('/migrate/process-pending', async (req, res) => {
   // Auth: require migration trigger key
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
@@ -2484,7 +2542,7 @@ app.post('/migrate/process-pending', async (req, res) => {
  * Classifies each user's cookies by which key can decrypt them.
  * Auth: X-Migration-Key header.
  */
-app.post('/migrate/verify-encryption', async (req, res) => {
+appData.post('/migrate/verify-encryption', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2553,7 +2611,7 @@ app.post('/migrate/verify-encryption', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be active.
  */
-app.post('/migrate/upgrade-to-tee-key', async (req, res) => {
+appData.post('/migrate/upgrade-to-tee-key', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2665,7 +2723,7 @@ app.post('/migrate/upgrade-to-tee-key', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be initialized.
  */
-app.post('/migrate/encrypt-incoming', async (req, res) => {
+appData.post('/migrate/encrypt-incoming', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2704,7 +2762,7 @@ app.post('/migrate/encrypt-incoming', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be initialized.
  */
-app.post('/migrate/verify-decrypt', async (req, res) => {
+appData.post('/migrate/verify-decrypt', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2743,7 +2801,7 @@ app.post('/migrate/verify-decrypt', async (req, res) => {
  * Precondition: DStack key must be initialized.
  * Env required: MIGRATION_TARGET_TEE_URL, MIGRATION_TARGET_API_KEY
  */
-app.post('/migrate/tee-to-tee-single', async (req, res) => {
+appData.post('/migrate/tee-to-tee-single', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2848,7 +2906,7 @@ app.post('/migrate/tee-to-tee-single', async (req, res) => {
 const startTime = Date.now();
 
 // v3-s: Debug screenshot endpoint (with API key auth)
-app.get('/debug/screenshot/:token', (req, res) => {
+appAuth.get('/debug/screenshot/:token', (req, res) => {
   if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
     return res.status(404).json({ error: 'Debug screenshots disabled' });
   }
@@ -2874,7 +2932,7 @@ app.get('/debug/screenshot/:token', (req, res) => {
 });
 
 // v3-w: List all active debug screenshots
-app.get('/debug/screenshots', (req, res) => {
+appAuth.get('/debug/screenshots', (req, res) => {
   if (process.env.ENABLE_DEBUG_SCREENSHOTS !== 'true') {
     return res.json({ enabled: false, count: 0, screenshots: [] });
   }
@@ -2912,7 +2970,7 @@ app.get('/debug/screenshots', (req, res) => {
 });
 
 // z-4: Get all screenshots for a specific auth session
-app.get('/debug/screenshots/:authSessionId', (req, res) => {
+appAuth.get('/debug/screenshots/:authSessionId', (req, res) => {
   const apiKey = req.headers['x-api-key'] as string;
   const allowedKeys = (process.env.XORDI_API_KEY || '').split(',').filter((k: string) => k);
   if (!apiKey || !allowedKeys.includes(apiKey)) {
@@ -3014,9 +3072,12 @@ app.get('/tee-info', async (req, res) => {
     res.json({
       app_id: info.app_id,
       instance_id: info.instance_id,
-        compose_hash: info.compose_hash,
+      compose_hash: info.compose_hash,
       tcb_info: info.tcb_info,
-      dstack_sdk_version: (() => { try { return require('./package.json').dependencies['@phala/dstack-sdk']; } catch { return 'unknown'; } })()
+      dstack_sdk_version: (() => { try { return require('./package.json').dependencies['@phala/dstack-sdk']; } catch { return 'unknown'; } })(),
+      // v1.2.1 — Which process answered: 'auth', 'data', or 'all' (legacy single-process).
+      // Callers that pool both URLs can use this to verify they hit the intended process.
+      mode: MODE
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to get TEE info', details: err.message });
@@ -3026,29 +3087,43 @@ app.get('/tee-info', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 async function startServer(): Promise<void> {
+  // v1.2.1 — initDStack is called in BOTH modes. Cookie + watch-history keys
+  // are derived identically in both processes (DStack platform guarantees
+  // deterministic key derivation per app_id). The data process needs the
+  // watch-history key for crypto; the auth process technically doesn't use
+  // it, but initDStack also sets the cookie key which cookie helpers rely on.
+  // Keeping initDStack unconditional also keeps the startup contract simple.
   await initDStack();
 
-  sessionManager = new SessionManager();
-  sessionManager.initialize();
+  // v1.2.1 — Auth-only bootstrap: SessionManager, AuthSessionManager, the
+  // enclave module loader, and the Xordi security module are all used only
+  // by auth routes (browser orchestration, QR/portal flows, /scrape, etc).
+  // Skipping them on the data process saves a few hundred ms of startup +
+  // frees memory from unused state. If TOKSCOPE_MODE=all (legacy), these
+  // still init because isAuth is true.
+  if (isAuth) {
+    sessionManager = new SessionManager();
+    sessionManager.initialize();
 
-  authSessionManager = new AuthSessionManager();
-  console.log('🔐 Auth session manager initialized');
+    authSessionManager = new AuthSessionManager();
+    console.log('🔐 Auth session manager initialized');
 
-  moduleLoader = new EnclaveModuleLoader();
-  console.log('🔒 Proprietary module loader initialized');
+    moduleLoader = new EnclaveModuleLoader();
+    console.log('🔒 Proprietary module loader initialized');
 
-  // Initialize Xordi security module (Python subprocess)
-  await xordiSecurityModule.initialize();
-  console.log('🔐 Xordi security module initialized');
+    // Initialize Xordi security module (Python subprocess)
+    await xordiSecurityModule.initialize();
+    console.log('🔐 Xordi security module initialized');
 
-  // Cleanup expired auth sessions periodically
-  setInterval(async () => {
-    try {
-      await authSessionManager?.cleanupExpired();
-    } catch (e: any) {
-      console.error('Auth session cleanup failed:', e.message);
-    }
-  }, 60000); // Every minute
+    // Cleanup expired auth sessions periodically
+    setInterval(async () => {
+      try {
+        await authSessionManager?.cleanupExpired();
+      } catch (e: any) {
+        console.error('Auth session cleanup failed:', e.message);
+      }
+    }, 60000); // Every minute
+  }
 
   // v1.1.9: event-loop-lag monitor. Catches regressions of the v1.1.8 bug
   // where synchronous crypto on the main thread starved auth orchestration.

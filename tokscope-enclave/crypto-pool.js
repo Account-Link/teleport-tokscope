@@ -25,11 +25,27 @@ const DEFAULT_WORKER_COUNT = 3;
 const CALL_TIMEOUT_MS = 10_000;
 
 class CryptoPool {
+  /**
+   * @param {number} [workerCount] - Number of crypto worker threads to spawn.
+   *   - `undefined` → use TEE_CRYPTO_WORKERS env (default 3). Normal case.
+   *   - `0`         → DISABLED MODE (v1.2.1+). No workers spawn, setKey/
+   *                   waitUntilReady no-op-resolve so startup gating stays
+   *                   happy, but encrypt/decrypt/decryptAndDedup throw a
+   *                   loud error if anyone calls them. Used by the AUTH
+   *                   process after the dual-process split — auth routes
+   *                   never touch watch-history crypto (verified by grep
+   *                   in server.ts), so worker-thread overhead and main-
+   *                   thread postMessage churn are pure waste there.
+   *   - positive N  → explicit override (tests).
+   */
   constructor(workerCount) {
-    const n = Number.isFinite(workerCount) && workerCount > 0
+    // Allow explicit 0 to mean "disabled"; undefined means "use env default".
+    const explicit = Number.isFinite(workerCount);
+    const n = explicit
       ? workerCount
       : parseInt(process.env.TEE_CRYPTO_WORKERS || String(DEFAULT_WORKER_COUNT), 10);
-    this.workerCount = n > 0 ? n : DEFAULT_WORKER_COUNT;
+    this.workerCount = n >= 0 ? n : DEFAULT_WORKER_COUNT;
+    this.disabled = this.workerCount === 0;
     /** @type {Array<WorkerEntry|null>} */
     this.workers = new Array(this.workerCount).fill(null);
     this.nextIdx = 0;
@@ -38,12 +54,20 @@ class CryptoPool {
     /** @type {Promise<void>|null} */
     this.readyPromise = null;
     this.shuttingDown = false;
+    if (this.disabled) {
+      log.ok('TEE', 'crypto_pool_disabled', { reason: 'auth_mode_or_explicit_zero' });
+    }
   }
 
   /**
    * Set the encryption key and (re)initialize all workers.
    * Resolves when every worker has acknowledged the key.
    * Called from server.ts initDStack() right after getKey('watch-history-encryption').
+   *
+   * v1.2.1: in disabled mode (auth process), stores the key for isReady()
+   * semantics, resolves readyPromise immediately, and spawns zero workers.
+   * This keeps tee-crypto.js's startup gate (waitForWorkersReady) unblocked
+   * in auth mode without spawning unnecessary worker threads.
    */
   async setKey(keyBuffer) {
     const buf = Buffer.from(keyBuffer);
@@ -51,6 +75,12 @@ class CryptoPool {
       throw new Error(`CryptoPool.setKey: expected 32-byte key, got ${buf.length}`);
     }
     this.key = buf;
+
+    if (this.disabled) {
+      // No workers to send the key to; mark ready so startup gating passes.
+      this.readyPromise = Promise.resolve();
+      return this.readyPromise;
+    }
 
     // (Re)spawn any missing workers
     for (let i = 0; i < this.workerCount; i++) {
@@ -78,18 +108,31 @@ class CryptoPool {
   }
 
   isReady() {
+    if (this.disabled) {
+      // "Ready" in the disabled sense: key installed, ready to REFUSE requests.
+      // Callers that gate actual crypto work should not be reached on this process
+      // (auth routes don't touch watch-history crypto), but returning true here
+      // keeps startup/health checks truthful about init status.
+      return this.key !== null && this.readyPromise !== null;
+    }
     return this.key !== null
       && this.workers.every((w) => w !== null)
       && this.readyPromise !== null;
   }
 
   async encrypt(data) {
+    if (this.disabled) {
+      throw new Error('CryptoPool: encrypt() called on disabled pool (TOKSCOPE_MODE=auth). This is a routing bug — auth process should not reach watch-history crypto.');
+    }
     await this.waitUntilReady();
     const entry = this._pickWorker();
     return this._sendTo(entry, { op: 'encrypt', data });
   }
 
   async decrypt(hex) {
+    if (this.disabled) {
+      throw new Error('CryptoPool: decrypt() called on disabled pool (TOKSCOPE_MODE=auth). This is a routing bug — auth process should not reach watch-history crypto.');
+    }
     await this.waitUntilReady();
     const entry = this._pickWorker();
     return this._sendTo(entry, { op: 'decrypt', hex });
@@ -105,6 +148,9 @@ class CryptoPool {
    * @returns {Promise<{newVideos: any[], newlyAddedIds: string[], totalRawVideos: number, pagesFailed: number}>}
    */
   async decryptAndDedup(hexes, seenIds) {
+    if (this.disabled) {
+      throw new Error('CryptoPool: decryptAndDedup() called on disabled pool (TOKSCOPE_MODE=auth). This is a routing bug — auth process should not reach watch-history crypto.');
+    }
     await this.waitUntilReady();
     const entry = this._pickWorker();
     return this._sendTo(entry, { op: 'decryptAndDedup', hexes, seenIds });
@@ -219,4 +265,22 @@ class CryptoPool {
 }
 
 // Export a singleton so callers (tee-crypto.js, server.ts) share one pool.
-module.exports = new CryptoPool();
+//
+// v1.2.1 — Crypto worker pool is data-process-only.
+// The pool exists exclusively to offload AES-GCM encrypt/decrypt of
+// watch-history payloads (~500 KB-1 MB each) off the main event loop. Only
+// data-process routes (/api/enclave/{encrypt,decrypt}-watch-history{,-v2},
+// /migrate/*) ever reach these code paths. Spawning 3 worker threads in the
+// auth process would waste memory (~30-50 MB per worker) and muddy the
+// "auth has its own clean event loop" invariant — worker-thread postMessage
+// callbacks ARE main-thread work. Zero workers in auth = zero main-thread
+// crypto pings ever.
+//
+// Why throw on encrypt/decrypt calls in auth mode (instead of silently
+// falling back to synchronous crypto)? A silent fallback would hide a
+// programmer error: if a new auth-side route ever reached for this pool,
+// we want a loud failure at dev time, not a mysterious auth-process
+// event-loop regression in prod.
+const MODE = (process.env.TOKSCOPE_MODE || 'all').toLowerCase();
+const POOL_ENABLED = MODE === 'data' || MODE === 'all';
+module.exports = new CryptoPool(POOL_ENABLED ? undefined : 0);
