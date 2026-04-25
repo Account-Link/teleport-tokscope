@@ -34,35 +34,40 @@ const BROWSER_MANAGER_URL = process.env.BROWSER_MANAGER_URL || 'http://browser-m
 // ---------------------------------------------------------------------------
 // v1.2.1 — Dual-process mode gate.
 //
-// The tokscope-enclave image runs in one of three modes, selected at startup
+// The tokscope-enclave image runs in one of these modes, selected at startup
 // by the TOKSCOPE_MODE env var (set in docker-compose per service):
 //
-//   TOKSCOPE_MODE=auth   → this process serves ONLY authentication routes
-//                           (/auth/*, /upload-session, /containers, etc.)
-//                           No crypto worker pool, no migration routes.
-//                           Gives auth its own Node event loop so heavy
-//                           watch-history decrypts on the data process
-//                           physically cannot starve Playwright CDP connects.
+//   TOKSCOPE_MODE=auth          → only authentication routes (/auth/*,
+//                                  /upload-session, /containers, etc.)
+//                                  No crypto worker pool, no data routes.
 //
-//   TOKSCOPE_MODE=data   → this process serves ONLY data routes
-//                           (/api/tiktok/execute, /api/enclave/*, /migrate/*).
-//                           Owns the crypto worker pool. No browser-manager
-//                           calls. No auth session state.
+//   TOKSCOPE_MODE=data-customer → only customer-hot-path data routes:
+//                                  /api/tiktok/execute, /api/enclave/decrypt-
+//                                  watch-history{,-v2}. Owns its own crypto
+//                                  worker pool. v1.2.1.1 split.
 //
-//   TOKSCOPE_MODE=all    → single-process legacy mode (what we ran pre-v1.2.1).
-//                           Registers every route. Kept for local dev and as
-//                           a rollback safety valve — if the split misbehaves
-//                           in prod, setting one container to 'all' restores
-//                           pre-v1.2.1 behavior without a code revert.
+//   TOKSCOPE_MODE=data-bulk     → only bulk/admin data routes:
+//                                  /api/enclave/encrypt-watch-history,
+//                                  /migrate/*. Own crypto pool. v1.2.1.1 split.
+//
+//   TOKSCOPE_MODE=data          → backward-compat: registers BOTH data-customer
+//                                  and data-bulk route sets in a single process
+//                                  (matches pre-v1.2.1.1 single-data-process
+//                                  behavior). Used for v1.2.1 → v1.2.1.1
+//                                  rollback without a code revert.
+//
+//   TOKSCOPE_MODE=all           → registers every route. Local dev convenience.
 //
 // Both processes share the same CVM, same app_id, same DStack-derived keys —
 // key derivation is deterministic per (app_id, key_id), a DStack platform
 // guarantee. Encrypted rows written by one process are readable by the other.
 // ---------------------------------------------------------------------------
-const MODE = (process.env.TOKSCOPE_MODE || 'all').toLowerCase();  // 'auth' | 'data' | 'all'
+const MODE = (process.env.TOKSCOPE_MODE || 'all').toLowerCase();
 const isAuth = MODE === 'auth' || MODE === 'all';
-const isData = MODE === 'data' || MODE === 'all';
-console.log(`[TEE] Starting in TOKSCOPE_MODE=${MODE} (auth=${isAuth}, data=${isData})`);
+const isDataCustomer = MODE === 'data-customer' || MODE === 'data' || MODE === 'all';
+const isDataBulk = MODE === 'data-bulk' || MODE === 'data' || MODE === 'all';
+const isData = isDataCustomer || isDataBulk;  // any data-bearing mode
+console.log(`[TEE] Starting in TOKSCOPE_MODE=${MODE} (auth=${isAuth}, data-customer=${isDataCustomer}, data-bulk=${isDataBulk})`);
 
 interface SessionData {
   user?: {
@@ -483,19 +488,20 @@ const app = express();
 app.use(express.json({ limit: '500kb' }));
 
 // ---------------------------------------------------------------------------
-// v1.2.1 — Mode-gated route registrars.
+// v1.2.1.1 — Mode-gated route registrars.
 //
-// Each route below uses ONE of three registrars:
-//   appAuth.X(...)  → only registered when isAuth (MODE=auth or all)
-//   appData.X(...)  → only registered when isData (MODE=data or all)
-//   app.X(...)      → ALWAYS registered (shared: /health, /ready, /tee-info)
+// Each route uses ONE of these registrars:
+//   appAuth.X(...)         → only when isAuth (MODE=auth or all)
+//   appDataCustomer.X(...) → only when isDataCustomer (MODE=data-customer,
+//                            data, or all)
+//   appDataBulk.X(...)     → only when isDataBulk (MODE=data-bulk, data, or all)
+//   app.X(...)             → ALWAYS registered (shared: /health, /ready, /tee-info)
 //
 // In the "off" mode the methods no-op at registration time — an unregistered
-// route will 404 at request time, which is the correct behavior (data client
-// hitting an auth-only process, or vice versa, should fail loudly).
+// route will 404 at request time, which is the correct behavior.
 //
 // When adding a new route: decide which process should own it and use the
-// matching registrar. If unsure, check the table in RELEASE-v1.2.1-PROD1.md.
+// matching registrar. See route table in RELEASE-v1.2.1.1-PROD1.md.
 // ---------------------------------------------------------------------------
 const noopApp: any = {
   get: () => noopApp,
@@ -505,7 +511,8 @@ const noopApp: any = {
   use: () => noopApp,
 };
 const appAuth: typeof app = (isAuth ? app : noopApp) as any;
-const appData: typeof app = (isData ? app : noopApp) as any;
+const appDataCustomer: typeof app = (isDataCustomer ? app : noopApp) as any;
+const appDataBulk: typeof app = (isDataBulk ? app : noopApp) as any;
 
 let browser: Browser | null = null;
 let page: Page | null = null;
@@ -1890,7 +1897,7 @@ appAuth.get('/containers', async (req, res) => {
  * - Executes signed request to TikTok
  * - Returns response (public video metadata)
  */
-appData.post('/api/tiktok/execute', async (req, res) => {
+appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
   try {
     const { sec_user_id, wireguard_bucket, ipfoxy_session, request } = req.body;
 
@@ -2201,7 +2208,7 @@ appData.post('/api/tiktok/execute', async (req, res) => {
  * Called by borgcube when a 3P app requests watch history for an authorized user.
  * borgcube pre-authorizes the 3P app before proxying here.
  */
-appData.post('/api/enclave/decrypt-watch-history', async (req, res) => {
+appDataCustomer.post('/api/enclave/decrypt-watch-history', async (req, res) => {
   try {
     // Auth: same XORDI_API_KEY as /api/tiktok/execute
     const apiKey = req.header('X-Api-Key');
@@ -2261,7 +2268,7 @@ appData.post('/api/enclave/decrypt-watch-history', async (req, res) => {
  * the TEE pulls them from borgcube using the manifest + page endpoints.
  * This avoids body size limits and reduces borgcube→TEE round-trips to one.
  */
-appData.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
+appDataCustomer.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
   try {
     // Auth
     const apiKey = req.header('X-Api-Key');
@@ -2287,9 +2294,10 @@ appData.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
     }
 
     // 1. Fetch manifest from borgcube
+    // 30s absorbs xordi-api load variance; 10s was firing under contention.
     const manifestResp = await axios.get(
       `${xordiApiUrl}/api/enclave/get-encrypted-watch-history-manifest/${sec_user_id}`,
-      { headers: { 'X-Api-Key': xordiApiKey }, timeout: 10000 }
+      { headers: { 'X-Api-Key': xordiApiKey }, timeout: 30000 }
     );
 
     if (!manifestResp.data?.pages?.length) {
@@ -2397,7 +2405,7 @@ appData.post('/api/enclave/decrypt-watch-history-v2', async (req, res) => {
  * Called by borgcube migration script to encrypt existing plaintext watch history.
  * Sunset after Phase 4a completes (all plaintext deleted).
  */
-appData.post('/api/enclave/encrypt-watch-history', async (req, res) => {
+appDataBulk.post('/api/enclave/encrypt-watch-history', async (req, res) => {
   try {
     // Auth
     const apiKey = req.header('X-Api-Key');
@@ -2445,7 +2453,7 @@ appData.post('/api/enclave/encrypt-watch-history', async (req, res) => {
  * POST /migrate/process-pending
  * Requires X-Migration-Key header matching MIGRATION_TRIGGER_KEY env var
  */
-appData.post('/migrate/process-pending', async (req, res) => {
+appDataBulk.post('/migrate/process-pending', async (req, res) => {
   // Auth: require migration trigger key
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
@@ -2542,7 +2550,7 @@ appData.post('/migrate/process-pending', async (req, res) => {
  * Classifies each user's cookies by which key can decrypt them.
  * Auth: X-Migration-Key header.
  */
-appData.post('/migrate/verify-encryption', async (req, res) => {
+appDataBulk.post('/migrate/verify-encryption', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2611,7 +2619,7 @@ appData.post('/migrate/verify-encryption', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be active.
  */
-appData.post('/migrate/upgrade-to-tee-key', async (req, res) => {
+appDataBulk.post('/migrate/upgrade-to-tee-key', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2723,7 +2731,7 @@ appData.post('/migrate/upgrade-to-tee-key', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be initialized.
  */
-appData.post('/migrate/encrypt-incoming', async (req, res) => {
+appDataBulk.post('/migrate/encrypt-incoming', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2762,7 +2770,7 @@ appData.post('/migrate/encrypt-incoming', async (req, res) => {
  * Auth: X-Migration-Key header.
  * Precondition: DStack key must be initialized.
  */
-appData.post('/migrate/verify-decrypt', async (req, res) => {
+appDataBulk.post('/migrate/verify-decrypt', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 
@@ -2801,7 +2809,7 @@ appData.post('/migrate/verify-decrypt', async (req, res) => {
  * Precondition: DStack key must be initialized.
  * Env required: MIGRATION_TARGET_TEE_URL, MIGRATION_TARGET_API_KEY
  */
-appData.post('/migrate/tee-to-tee-single', async (req, res) => {
+appDataBulk.post('/migrate/tee-to-tee-single', async (req, res) => {
   const triggerKey = req.header('X-Migration-Key');
   const expectedKey = process.env.MIGRATION_TRIGGER_KEY;
 

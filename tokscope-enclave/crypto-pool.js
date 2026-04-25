@@ -22,7 +22,9 @@ const { log } = require('./lib/log');
 
 const WORKER_SCRIPT = path.resolve(__dirname, 'crypto-worker.js');
 const DEFAULT_WORKER_COUNT = 3;
-const CALL_TIMEOUT_MS = 10_000;
+// 30s allows 10-page batch decrypts on heavy users to finish without killing
+// the worker. Stays under EnclaveClient's 90s axios budget.
+const CALL_TIMEOUT_MS = 30_000;
 
 class CryptoPool {
   /**
