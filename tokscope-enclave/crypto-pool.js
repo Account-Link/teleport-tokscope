@@ -268,21 +268,18 @@ class CryptoPool {
 
 // Export a singleton so callers (tee-crypto.js, server.ts) share one pool.
 //
-// v1.2.1 — Crypto worker pool is data-process-only.
-// The pool exists exclusively to offload AES-GCM encrypt/decrypt of
-// watch-history payloads (~500 KB-1 MB each) off the main event loop. Only
-// data-process routes (/api/enclave/{encrypt,decrypt}-watch-history{,-v2},
-// /migrate/*) ever reach these code paths. Spawning 3 worker threads in the
-// auth process would waste memory (~30-50 MB per worker) and muddy the
-// "auth has its own clean event loop" invariant — worker-thread postMessage
-// callbacks ARE main-thread work. Zero workers in auth = zero main-thread
-// crypto pings ever.
+// v1.2.1.1 — Crypto worker pool is enabled in any mode that serves data
+// routes: data-customer, data-bulk, data (backward-compat), and all (dev).
+// Disabled in auth mode (and any unrecognized mode) so worker threads
+// don't waste memory on processes that never touch watch-history crypto.
 //
-// Why throw on encrypt/decrypt calls in auth mode (instead of silently
+// Why throw on encrypt/decrypt calls when disabled (instead of silently
 // falling back to synchronous crypto)? A silent fallback would hide a
-// programmer error: if a new auth-side route ever reached for this pool,
-// we want a loud failure at dev time, not a mysterious auth-process
-// event-loop regression in prod.
+// routing bug: if a customer route somehow ended up registered on auth,
+// we want a loud failure, not a mysterious main-thread regression.
 const MODE = (process.env.TOKSCOPE_MODE || 'all').toLowerCase();
-const POOL_ENABLED = MODE === 'data' || MODE === 'all';
+const POOL_ENABLED = MODE === 'data'
+  || MODE === 'data-customer'
+  || MODE === 'data-bulk'
+  || MODE === 'all';
 module.exports = new CryptoPool(POOL_ENABLED ? undefined : 0);
