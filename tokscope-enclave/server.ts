@@ -2194,8 +2194,24 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     res.json(tiktokResponse.data);
 
   } catch (error: any) {
-    console.error('TikTok request execution failed:', error.message);
-    res.status(500).json({ error: error.message });
+    // v1.2.1.1.3 — capture safe diagnostic fields so we can distinguish where
+    // the abort came from (TikTok RST vs proxy drop vs WG tunnel reset).
+    // SAFE FIELDS ONLY — do NOT include error.config / error.request /
+    // error.response (those carry cookies, X-Bogus, auth headers).
+    log.error('TEE', 'tiktok_request_failed', {
+      message: error.message,
+      code: error.code,
+      syscall: error.syscall,
+      address: error.address,
+      port: error.port,
+      cause_code: error.cause?.code,
+      cause_message: error.cause?.message,
+      bucket: req.body?.wireguard_bucket,
+    });
+    res.status(500).json({
+      error: error.message,
+      code: error.code,
+    });
   }
 });
 
