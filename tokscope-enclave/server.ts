@@ -2175,10 +2175,15 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       // Encrypt the full response (video data + everything).
       // v1.1.9: async — delegated to worker_threads pool.
       const encryptedHex = await teeCrypto.encryptWatchHistory(responseData);
+      // v1.2.1.1.4: include per-page video count as non-encrypted metadata so the
+      // orchestrator can populate watch_history_sessions.unique_videos accurately.
+      // Matches the existing exposure level of has_more/cursor (TikTok pagination metadata).
+      const videosCount = Array.isArray(responseData.aweme_list) ? responseData.aweme_list.length : 0;
       return res.json({
         encrypted: encryptedHex,
         has_more: hasMore,
         cursor: cursor,
+        videos_count: videosCount,
       });
     } else if (req.body.encrypt_response && !teeCrypto.isWatchHistoryKeyReady()) {
       // encrypt_response requested but DStack key not available
