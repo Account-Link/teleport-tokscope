@@ -2165,10 +2165,28 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
     }
 
     const tiktokResponse = await axios.request(axiosConfig);
+    const responseData = tiktokResponse.data;
+
+    // v1.2.1.1.5: surface TikTok-side errors before encryption. Without this,
+    // non-zero status_code responses (rate-limit, bad params, expired session)
+    // were silently encrypted into encrypted_watch_history as "successful"
+    // pages with zero videos — masking real failures and polluting storage.
+    const tiktokStatusCode = responseData?.status_code;
+    if (typeof tiktokStatusCode === 'number' && tiktokStatusCode !== 0) {
+      log.warn('TEE', 'tiktok_status_error', {
+        status_code: tiktokStatusCode,
+        status_msg: responseData?.status_msg || null,
+        bucket: req.body?.wireguard_bucket,
+      });
+      return res.status(502).json({
+        error: 'tiktok_status_error',
+        tiktok_status_code: tiktokStatusCode,
+        tiktok_status_msg: responseData?.status_msg || null,
+      });
+    }
 
     // 8. Return response — optionally encrypt if requested (v1.1.8)
     if (req.body.encrypt_response && teeCrypto.isWatchHistoryKeyReady()) {
-      const responseData = tiktokResponse.data;
       // Extract pagination metadata BEFORE encrypting (borgcube needs these for scrape loop)
       const hasMore = !!(responseData.has_more ?? responseData.hasMore);
       const cursor = responseData.cursor || responseData.max_cursor || null;
@@ -2177,8 +2195,11 @@ appDataCustomer.post('/api/tiktok/execute', async (req, res) => {
       const encryptedHex = await teeCrypto.encryptWatchHistory(responseData);
       // v1.2.1.1.4: include per-page video count as non-encrypted metadata so the
       // orchestrator can populate watch_history_sessions.unique_videos accurately.
-      // Matches the existing exposure level of has_more/cursor (TikTok pagination metadata).
-      const videosCount = Array.isArray(responseData.aweme_list) ? responseData.aweme_list.length : 0;
+      // v1.2.1.1.5: TikTok responses use multiple field names depending on endpoint
+      // (aweme_list / itemList / videos). Match crypto-worker.js:91 fallback chain
+      // — checking only aweme_list missed the data in many real responses.
+      const videoArr = responseData?.aweme_list || responseData?.itemList || responseData?.videos;
+      const videosCount = Array.isArray(videoArr) ? videoArr.length : 0;
       return res.json({
         encrypted: encryptedHex,
         has_more: hasMore,

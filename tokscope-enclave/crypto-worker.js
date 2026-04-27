@@ -88,10 +88,29 @@ function doDecryptAndDedup(hexes, seenIdsIn) {
   for (const hex of hexes) {
     try {
       const decrypted = doDecrypt(hex);
-      const videos = decrypted?.aweme_list || decrypted?.videos || [];
+      // v1.2.1.1.5: align field-name fallback chain with the encrypt path
+      // (server.ts already uses aweme_list || itemList || videos). Future-proof
+      // against TikTok format shifts.
+      const videos = decrypted?.aweme_list || decrypted?.itemList || decrypted?.videos || [];
+      // v1.2.1.1.5: TikTok's watch-history response includes a parallel
+      // aweme_watch_history array of millisecond-string timestamps aligned by
+      // index with aweme_list. Stitch each timestamp onto its video so the
+      // helper transform can surface watchedAt instead of always returning null.
+      // Pre-fix: aweme_watch_history was decrypted but discarded — every video
+      // returned watchedAt: null even though the data was in the encrypted blob.
+      const watchTimestamps = Array.isArray(decrypted?.aweme_watch_history)
+        ? decrypted.aweme_watch_history
+        : null;
       if (Array.isArray(videos)) {
         totalRawVideos += videos.length;
-        for (const v of videos) {
+        for (let i = 0; i < videos.length; i++) {
+          const v = videos[i];
+          if (watchTimestamps && watchTimestamps[i] !== undefined && watchTimestamps[i] !== null) {
+            const ts = parseInt(watchTimestamps[i], 10);
+            if (!isNaN(ts) && ts > 0) {
+              v.watched_at = new Date(ts).toISOString();
+            }
+          }
           const id = String(v.aweme_id || v.video_id || v.id || '');
           if (id && !seen.has(id)) {
             seen.add(id);
